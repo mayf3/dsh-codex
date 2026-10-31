@@ -365,6 +365,8 @@ export class OpenAICodexCredentialStore implements CredentialStore {
     await this.assertSharedBoundary()
     try {
       return await this.withWriterLock(async () => {
+        // Owner scope may repair unknown credentials, never unsafe intent evidence.
+        if (this.shared && isOwnerReauth) await this.readIntent()
         let current: OAuthCredential | undefined
         let ownerReplacesInvalidDocument = false
         try { current = this.shared && !isOwnerReauth ? await this.recoverPending() : await this.readRaw() }

@@ -363,9 +363,11 @@ export class OpenAICodexWebAuth {
 
   private async readStoredStatus(): Promise<OpenAICodexWebAuthStatus> {
     await this.beforeNetworkRequest?.();
+    let authenticated = false;
     try {
       const stored = await openAICodexAuthStatus(this.store);
       if (!stored.authenticated) return { status: "signed-out" };
+      authenticated = true;
       return {
         status: "signed-in",
         usage: await this.readUsage(),
@@ -377,6 +379,7 @@ export class OpenAICodexWebAuth {
           message: OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE,
         };
       }
+      if (!authenticated) throw error;
       return {
         status: "signed-in",
         usage: { rateLimits: [] },

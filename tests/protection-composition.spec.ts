@@ -1,4 +1,4 @@
-import { chmod, link, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -109,6 +109,39 @@ describe('main protection composition', () => {
     const error = await store.read(OPENAI_CODEX_PROVIDER).catch(error => error)
     expect(error).toBeInstanceOf(Error)
     expect(String(error)).not.toContain('fixture-access-secret-as-key')
+  })
+
+  for (const kind of ['symlink', 'hardlink', 'broad-mode'] as const) {
+    it(`rejects an unsafe ${kind} intent before an explicit Owner callback`, async () => {
+      const { root, store } = await fixture()
+      await writeFile(store.filename, JSON.stringify({ version: 1, credential: credential() }), { mode: 0o600 })
+      await pending(store)
+      const intentPath = `${store.filename}.refresh-intent.json`
+      const evidencePath = join(root, 'intent-evidence.json')
+      if (kind === 'symlink') { await rename(intentPath, evidencePath); await symlink(evidencePath, intentPath) }
+      else if (kind === 'hardlink') await link(intentPath, evidencePath)
+      else await chmod(intentPath, 0o644)
+      const original = await readFile(store.filename, 'utf8')
+      const evidence = await readFile(intentPath, 'utf8')
+      const before = await lstat(intentPath)
+      const callback = vi.fn(async () => ({ ...credential(), access: 'fixture-owner-new' }))
+      await expect(store.withOwnerReauth(() => store.modify(OPENAI_CODEX_PROVIDER, callback)))
+        .rejects.toBeInstanceOf(OpenAICodexReauthRequiredError)
+      expect(callback).not.toHaveBeenCalled()
+      expect(await readFile(store.filename, 'utf8')).toBe(original)
+      expect(await readFile(intentPath, 'utf8')).toBe(evidence)
+      const after = await lstat(intentPath)
+      expect({ ino: after.ino, dev: after.dev, mode: after.mode, nlink: after.nlink }).toEqual({ ino: before.ino, dev: before.dev, mode: before.mode, nlink: before.nlink })
+      expect(after.isSymbolicLink()).toBe(kind === 'symlink')
+    })
+  }
+
+  it('propagates non-reauth stored-status errors instead of reporting a signed-in account', async () => {
+    const { store } = await fixture()
+    await writeFile(store.filename, '{fixture-invalid-private-json', { mode: 0o600 })
+    const request = vi.fn<typeof fetch>()
+    await expect(new OpenAICodexWebAuth(store, { requestFetch: request }).status()).rejects.toThrow(/not valid JSON/)
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('rejects non-RFC3339 intent timestamps and never removes an orphan lock merely because its pid is gone', async () => {
