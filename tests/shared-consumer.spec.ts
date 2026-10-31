@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { OpenAICodexCredentialStore, OPENAI_CODEX_PROVIDER, OpenAICodexReauthRequiredError } from '../src/store.ts'
 import { isOpenAICodexReauthRequiredError, readOpenAICodexRateLimits } from '../src/usage.ts'
+import { OpenAICodexWebAuth } from '../src/auth-routes.ts'
 
 const gate = vi.hoisted(() => ({ filename: '', hook: undefined as (() => Promise<void>) | undefined }))
 vi.mock('node:fs/promises', async original => {
@@ -51,4 +52,12 @@ it('fences a pending intent that is published while the canonical read is in fli
   gate.hook = () => pending(store)
   await expect(store.read(OPENAI_CODEX_PROVIDER)).rejects.toMatchObject({ code: 'OPENAI_CODEX_REAUTH_REQUIRED' })
   expect(await readFile(store.refreshIntentFilename, 'utf8')).toContain('pending')
+})
+
+it('preserves non-reauth stored-status failures instead of reporting signed-in quota fallback', async () => {
+  const store = await fixture()
+  await writeFile(store.filename, '{invalid-json', { mode: 0o600 })
+  const web = new OpenAICodexWebAuth(store)
+  await expect(web.status()).rejects.toThrow(/not valid JSON/)
+  await web.dispose()
 })

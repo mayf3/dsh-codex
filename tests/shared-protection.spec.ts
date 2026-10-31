@@ -227,4 +227,23 @@ describe('shared protection composition', () => {
     expect(await value.read(OPENAI_CODEX_PROVIDER)).toMatchObject({ access: 'access-legacy-secret' })
     await expect(new OpenAICodexCredentialStore(value.filename).read(OPENAI_CODEX_PROVIDER)).rejects.toThrow(/mode 600/)
   })
+
+  it.each(['symbolic', 'hardlink', 'broad-mode'])('does not let explicit Owner recovery bypass intent metadata: %s', async kind => {
+    const value = await store()
+    await pending(value)
+    const intent = value.refreshIntentFilename
+    if (kind === 'symbolic') {
+      await rename(intent, `${intent}.target`)
+      await symlink(`${intent}.target`, intent)
+    } else if (kind === 'hardlink') await link(intent, `${intent}.link`)
+    else await chmod(intent, 0o644)
+    let calls = 0
+    await expect(value.withOwnerReauth(() => value.modify(OPENAI_CODEX_PROVIDER, async () => {
+      calls++
+      return credential('owner', Date.now() + 60_000)
+    }))).rejects.toMatchObject({ code: 'OPENAI_CODEX_REAUTH_REQUIRED' })
+    expect(calls).toBe(0)
+    expect(await lstat(intent)).toBeDefined()
+    expect(await readFile(value.filename, 'utf8')).toContain('access-old-secret')
+  })
 })

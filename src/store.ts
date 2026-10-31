@@ -272,6 +272,9 @@ export class OpenAICodexCredentialStore implements CredentialStore {
         const isOwnerReauth = this.ownerReauth.getStore() === true
         await this.assertSharedBoundary(isOwnerReauth)
         const hasIntent = this.shared && await lstatOptional(this.refreshIntentFilename) !== undefined
+        // Explicit Owner login may replace unknown credential contents, but it
+        // must obey the same private, single-inode intent boundary.
+        if (hasIntent && isOwnerReauth) await this.readIntent()
         const current = hasIntent
           ? isOwnerReauth ? undefined : await this.resolvePendingIntent(false, true)
           : await this.readRaw()

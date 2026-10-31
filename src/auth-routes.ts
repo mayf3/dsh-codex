@@ -224,14 +224,17 @@ export class OpenAICodexWebAuth {
   }
 
   private async readStoredStatus(): Promise<OpenAICodexWebAuthStatus> {
+    let storedStatusRead = false
     try {
       const stored = await openAICodexAuthStatus(this.store)
       if (!stored.authenticated) return { status: 'signed-out' }
+      storedStatusRead = true
       return { status: 'signed-in', usage: await readOpenAICodexRateLimits(this.store) }
     } catch (error: unknown) {
       if (isOpenAICodexReauthRequiredError(error)) {
         return { status: 'reauth-required', message: OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE }
       }
+      if (!storedStatusRead) throw error
       return { status: 'signed-in', usage: { rateLimits: [] }, quotaError: safeMessage(error) }
     }
   }
