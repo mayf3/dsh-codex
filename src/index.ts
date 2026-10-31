@@ -144,6 +144,9 @@ export type { OpenAICodexAuthStatus } from "./auth.ts";
 export {
   OpenAICodexCredentialStore,
   OPENAI_CODEX_AUTH_FILENAME,
+  OPENAI_CODEX_REAUTH_REQUIRED,
+  OPENAI_CODEX_REFRESH_IN_PROGRESS,
+  OpenAICodexRefreshInProgressError,
   OPENAI_CODEX_PROVIDER,
   openAICodexAuthPath,
 } from "./store.ts";

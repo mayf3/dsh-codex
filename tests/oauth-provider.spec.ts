@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { get } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createModels } from '@earendil-works/pi-ai'
 import type { AuthInteraction } from '@earendil-works/pi-ai'
+import { loginOpenAICodex } from '../src/auth.ts'
 import { openaiCodexProvider, refreshOpenAICodexCredential } from '../src/oauth-provider.ts'
 import { OpenAICodexCredentialStore, OPENAI_CODEX_PROVIDER } from '../src/store.ts'
 
@@ -51,7 +52,7 @@ describe('complete Codex OAuth refresh', () => {
   })
 
   it('lets pi-ai schedule refresh and atomically persists all fields in CPA format', async () => {
-    directory = await mkdtemp(join(tmpdir(), 'dsh-complete-oauth-'))
+    directory = await mkdtemp(join(await realpath(tmpdir()), 'dsh-complete-oauth-'))
     const filename = join(directory, 'auth.json')
     await writeFile(filename, JSON.stringify({ type: 'codex', access_token: old.access, refresh_token: old.refresh, account_id: 'account', id_token: 'old-id', expired: new Date(1).toISOString(), email: 'old@example.invalid', disabled: false }), { mode: 0o600 })
     const store = new OpenAICodexCredentialStore(filename)
@@ -156,5 +157,29 @@ describe('complete Codex OAuth refresh', () => {
     const fetch = vi.fn<typeof globalThis.fetch>()
     await expect(refreshOpenAICodexCredential(old, AbortSignal.abort(), fetch)).rejects.toThrow()
     expect(fetch).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('explicit login recovery seam', () => {
+  it('replaces an unknown generation through real Models.login and preserves supplied transport', async () => {
+    directory = await mkdtemp(join(await realpath(tmpdir()), 'dsh-owner-login-'))
+    const store = new OpenAICodexCredentialStore(join(directory, 'auth.json'))
+    await store.modify(OPENAI_CODEX_PROVIDER, async () => old)
+    const info = await stat(store.filename)
+    await writeFile(`${store.filename}.refresh-intent.json`, JSON.stringify({ version: 1, generationId: `fs:${info.dev}:${info.ino}`, state: 'pending', startedAt: new Date().toISOString() }), { mode: 0o600 })
+    await writeFile(store.filename, '{fixture-malformed-private-document', { mode: 0o600 })
+    const data = response()
+    const transport = vi.fn<typeof fetch>(async input => {
+      const url = String(input)
+      if (url.endsWith('/deviceauth/usercode')) return Response.json({ device_auth_id: 'fixture-device', user_code: 'FIXTURE', interval: 0 })
+      if (url.endsWith('/deviceauth/token')) return Response.json({ authorization_code: 'fixture-approval', code_verifier: 'fixture-verifier' })
+      if (url.endsWith('/oauth/token')) return Response.json(data)
+      throw new Error('unexpected fixture URL')
+    })
+    await loginOpenAICodex({ signal: new AbortController().signal, prompt: async () => 'device_code', notify: () => {} }, store, transport)
+    expect(await store.read(OPENAI_CODEX_PROVIDER)).toMatchObject({ access: data.access_token, idToken: data.id_token })
+    await expect(stat(`${store.filename}.refresh-intent.json`)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(transport).toHaveBeenCalledTimes(4)
   })
 })

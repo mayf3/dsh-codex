@@ -3,7 +3,7 @@
 import { createModels } from '@earendil-works/pi-ai'
 import { openaiCodexProvider } from './oauth-provider.ts'
 import type { OpenAICodexCredentialStore } from './store.ts'
-import { OPENAI_CODEX_PROVIDER } from './store.ts'
+import { OpenAICodexReauthRequiredError, OpenAICodexRefreshInProgressError, OPENAI_CODEX_PROVIDER } from './store.ts'
 
 /** Fixed endpoint used by the official Codex client for ChatGPT rate limits. */
 export const OPENAI_CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -22,15 +22,7 @@ export const OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE = 'OpenAI Codex authorization 
  * The error intentionally carries no response, credential, or account data so
  * callers can safely pass its fixed message across the Web boundary.
  */
-export class OpenAICodexReauthRequiredError extends Error {
-  readonly code = OPENAI_CODEX_REAUTH_REQUIRED_CODE
-
-  constructor() {
-    super(OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE)
-    this.name = 'OpenAICodexReauthRequiredError'
-  }
-}
-
+export { OpenAICodexReauthRequiredError } from './store.ts'
 /** Identify the dedicated reauthorization failure without comparing messages. */
 export function isOpenAICodexReauthRequiredError(error: unknown): error is OpenAICodexReauthRequiredError {
   return error instanceof OpenAICodexReauthRequiredError
@@ -288,7 +280,18 @@ export async function readOpenAICodexRateLimits(
 ): Promise<OpenAICodexUsage> {
   const models = createModels({ credentials: store })
   models.setProvider(openaiCodexProvider(requestFetch))
-  const auth = await models.getAuth(OPENAI_CODEX_PROVIDER)
+  const auth = await models.getAuth(OPENAI_CODEX_PROVIDER).catch((error: unknown) => {
+    // pi-ai preserves store failures as Error.cause; keep the public store
+    // identity at this consumer boundary, including bounded refresh waits.
+    const seen = new Set<Error>()
+    let cause: unknown = error
+    while (cause instanceof Error && !seen.has(cause)) {
+      if (cause instanceof OpenAICodexReauthRequiredError || cause instanceof OpenAICodexRefreshInProgressError) throw cause
+      seen.add(cause)
+      cause = cause.cause
+    }
+    throw error
+  })
   const credential = await store.read(OPENAI_CODEX_PROVIDER)
   const access = auth?.auth.apiKey
   const accountId = credential?.type === 'oauth' ? credential.accountId : undefined

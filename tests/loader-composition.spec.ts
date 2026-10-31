@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -22,7 +22,7 @@ afterEach(async () => {
 
 describe('OpenAI Codex real composition', () => {
   it('loads through the Loader, exposes the catalog, and unregisters on disposal', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-openai-codex-loader-'))
+    root = await mkdtemp(join(await realpath(tmpdir()), 'dsh-openai-codex-loader-'))
     const configPath = join(root, 'cordis.yml')
     await writeFile(configPath, [
       '- id: llm',
@@ -32,6 +32,7 @@ describe('OpenAI Codex real composition', () => {
       '- id: llm-openai-codex',
       '  name: dsh-codex',
       '  config:',
+      `    credentialFile: '${join(root, 'canonical-auth.json')}'`,
       '    contextWindow: 512000',
       '    models:',
       '      - gpt-5.6-luna',
@@ -62,6 +63,8 @@ describe('OpenAI Codex real composition', () => {
     })
     await ctx.loader.await()
 
+    expect(ctx.openAICodex.credentials.filename).toBe(join(root, 'canonical-auth.json'))
+    expect(ctx.openAICodex.policy.snapshot()).not.toHaveProperty('credentialFile')
     expect(ctx.llm.listProviders()).toEqual([{ id: 'openai-codex', name: 'OpenAI Codex' }])
     const models = await ctx.llm.listModels('openai-codex')
     expect(models.map(model => model.id)).toEqual(['gpt-5.6-terra', 'gpt-5.6-luna'])
