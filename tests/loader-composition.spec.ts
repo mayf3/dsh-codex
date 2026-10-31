@@ -32,6 +32,7 @@ describe('OpenAI Codex real composition', () => {
       '- id: llm-openai-codex',
       '  name: dsh-codex',
       '  config:',
+      `    credentialFile: ${join(root, 'canonical-auth.json')}`,
       '    models:',
       '      - gpt-5.6-luna',
       '      - gpt-5.6-terra',
@@ -61,6 +62,7 @@ describe('OpenAI Codex real composition', () => {
     })
     await ctx.loader.await()
 
+    expect(ctx.openAICodex.credentials.filename).toBe(join(root, 'canonical-auth.json'))
     expect(ctx.llm.listProviders()).toEqual([{ id: 'openai-codex', name: 'OpenAI Codex' }])
     const models = await ctx.llm.listModels('openai-codex')
     expect(models.map(model => model.id)).toEqual(['gpt-5.6-luna', 'gpt-5.6-terra'])

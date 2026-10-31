@@ -3,7 +3,7 @@
 import { createModels } from '@earendil-works/pi-ai'
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
 import type { OpenAICodexCredentialStore } from './store.ts'
-import { OPENAI_CODEX_PROVIDER } from './store.ts'
+import { OPENAI_CODEX_PROVIDER, OpenAICodexReauthRequiredError, OpenAICodexRefreshInProgressError } from './store.ts'
 
 /** Fixed endpoint used by the official Codex client for ChatGPT rate limits. */
 export const OPENAI_CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -16,20 +16,8 @@ export const OPENAI_CODEX_REAUTH_REQUIRED_CODE = 'OPENAI_CODEX_REAUTH_REQUIRED' 
 /** Fixed, secret-free message for a browser-facing reauthorization prompt. */
 export const OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE = 'OpenAI Codex authorization must be renewed'
 
-/**
- * Raised when the usage endpoint rejects the current OAuth session.
- *
- * The error intentionally carries no response, credential, or account data so
- * callers can safely pass its fixed message across the Web boundary.
- */
-export class OpenAICodexReauthRequiredError extends Error {
-  readonly code = OPENAI_CODEX_REAUTH_REQUIRED_CODE
-
-  constructor() {
-    super(OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE)
-    this.name = 'OpenAICodexReauthRequiredError'
-  }
-}
+/** Store fences and HTTP 401/403 share one public error identity. */
+export { OpenAICodexReauthRequiredError } from './store.ts'
 
 /** Identify the dedicated reauthorization failure without comparing messages. */
 export function isOpenAICodexReauthRequiredError(error: unknown): error is OpenAICodexReauthRequiredError {
@@ -227,7 +215,18 @@ export async function readOpenAICodexRateLimits(
 ): Promise<OpenAICodexUsage> {
   const models = createModels({ credentials: store })
   models.setProvider(openaiCodexProvider())
-  const auth = await models.getAuth(OPENAI_CODEX_PROVIDER)
+  const auth = await models.getAuth(OPENAI_CODEX_PROVIDER).catch((error: unknown) => {
+    // pi-ai wraps credential-store failures in ModelsError; preserve the store's
+    // stable public discriminant instead of leaking the wrapper to front doors.
+    const seen = new Set<unknown>()
+    let current: unknown = error
+    while (current instanceof Error && !seen.has(current)) {
+      if (current instanceof OpenAICodexReauthRequiredError || current instanceof OpenAICodexRefreshInProgressError) throw current
+      seen.add(current)
+      current = current.cause
+    }
+    throw error
+  })
   const credential = await store.read(OPENAI_CODEX_PROVIDER)
   const access = auth?.auth.apiKey
   const accountId = credential?.type === 'oauth' ? credential.accountId : undefined

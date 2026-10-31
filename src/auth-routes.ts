@@ -224,9 +224,9 @@ export class OpenAICodexWebAuth {
   }
 
   private async readStoredStatus(): Promise<OpenAICodexWebAuthStatus> {
-    const stored = await openAICodexAuthStatus(this.store)
-    if (!stored.authenticated) return { status: 'signed-out' }
     try {
+      const stored = await openAICodexAuthStatus(this.store)
+      if (!stored.authenticated) return { status: 'signed-out' }
       return { status: 'signed-in', usage: await readOpenAICodexRateLimits(this.store) }
     } catch (error: unknown) {
       if (isOpenAICodexReauthRequiredError(error)) {

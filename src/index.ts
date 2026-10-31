@@ -94,6 +94,9 @@ export type { OpenAICodexAuthStatus } from './auth.ts'
 export {
   OpenAICodexCredentialStore,
   OPENAI_CODEX_AUTH_FILENAME,
+  OPENAI_CODEX_REAUTH_REQUIRED,
+  OPENAI_CODEX_REFRESH_IN_PROGRESS,
+  OpenAICodexRefreshInProgressError,
   OPENAI_CODEX_PROVIDER,
   openAICodexAuthPath,
 } from './store.ts'
@@ -123,6 +126,8 @@ export const inject = ['llm', 'web']
 
 /** Composite model and standalone-search configuration. */
 export interface Config {
+  /** Explicit canonical filename for shared credentials. */
+  credentialFile?: string
   /** Model ids advertised by the provider; omitted to advertise the full catalog. */
   models?: string[] | undefined
   /** Model used for auxiliary standalone searches. */
@@ -144,6 +149,7 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
+  credentialFile: z.string(),
   models: z.union([z.const(undefined), z.array(z.string())]),
   searchModel: z.string().default(DEFAULT_OPENAI_CODEX_SEARCH_MODEL),
   searchMode: z.union(['cached', 'indexed', 'live'] as const).default(DEFAULT_OPENAI_CODEX_SEARCH_MODE),
@@ -164,6 +170,7 @@ export const Config: z<Config> = z.object({
 export function apply(ctx: Context, config: Config): void {
   installOpenAICodexSearchEvent()
   const service = new OpenAICodexService({
+    ...(config.credentialFile === undefined ? {} : { credentialFile: config.credentialFile }),
     ...config.models === undefined ? {} : { models: config.models },
     modelCatalog: openAICodexModelCatalog(),
     modifyReadImage: config.modifyReadImage ?? true,

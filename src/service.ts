@@ -23,6 +23,8 @@ declare module '@deepseek-ai/cordis' {
 
 /** Initial settings contributed by the bundle configuration. */
 export interface OpenAICodexServiceOptions extends ImageToolPreferences, ResponseApiPreferences {
+  /** Explicit shared credential document; omitted outside shared mode. */
+  credentialFile?: string
   models?: string[]
   modelCatalog: readonly ModelCatalogEntry[]
 }
@@ -32,10 +34,11 @@ export interface OpenAICodexServiceOptions extends ImageToolPreferences, Respons
  * Credentials and live policy stay singletons even when several front doors are mounted.
  */
 export class OpenAICodexService {
-  readonly credentials = new OpenAICodexCredentialStore()
+  readonly credentials: OpenAICodexCredentialStore
   readonly policy: ImageToolPolicy
 
   constructor(options: OpenAICodexServiceOptions) {
+    this.credentials = new OpenAICodexCredentialStore(options.credentialFile)
     this.policy = new ImageToolPolicy(options, options.modelCatalog)
   }
 

@@ -27,7 +27,7 @@ export async function loginOpenAICodex(
 ): Promise<void> {
   const models = createModels({ credentials: store })
   models.setProvider(openaiCodexProvider())
-  await models.login(OPENAI_CODEX_PROVIDER, 'oauth', interaction)
+  await store.withOwnerReauth(() => models.login(OPENAI_CODEX_PROVIDER, 'oauth', interaction))
 }
 
 /**
