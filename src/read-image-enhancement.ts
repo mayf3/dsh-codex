@@ -13,6 +13,7 @@ import { assertImageCapable } from './image-capability.ts'
 import type { ImageToolPolicy } from './tool-policy.ts'
 import { fetchPublicHttpResource } from './public-http.ts'
 import type { PublicHttpRuntime } from './public-http.ts'
+import { OPENAI_CODEX_MESSAGE_SOURCE } from './message-source.ts'
 
 /** Harness's canonical image-reading tool name. */
 export const READ_IMAGE_TOOL_NAME = 'read_image'
@@ -147,7 +148,7 @@ export function enhancedReadImageTool(
       if (exec.parent !== undefined) {
         exec.deferContext(createUserMessage({
           content: contentOf(value),
-          source: { kind: 'plugin', plugin: 'dsh-openai-codex' },
+          source: OPENAI_CODEX_MESSAGE_SOURCE,
         }))
       }
       return value
@@ -168,6 +169,25 @@ interface ScopedEnhancement {
   readonly dispose: () => void
 }
 
+/**
+ * Whether one thrown value is Cordis's refusal to create an effect on a
+ * disposed scope.
+ *
+ * The public error code is judged structurally on purpose: when the plugin's
+ * `@deepseek-ai/cordis` and the running Host's resolve to different installation
+ * copies, the two `CordisError` classes differ, `instanceof` is false for the
+ * Host's refusal, and this benign case would escape as a real error.
+ * @param error - the value thrown by `agent.ctx.tools.register`.
+ * @returns true when the value is the inactive-scope refusal.
+ */
+function isInactiveEffect(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'INACTIVE_EFFECT'
+  )
+}
+
 /** Keep an enhanced `read_image` shadow on every live agent while the setting is enabled. */
 export function installReadImageEnhancement(
   ctx: Context,
@@ -176,6 +196,7 @@ export function installReadImageEnhancement(
 ): void {
   const installed = new Map<Agent, ScopedEnhancement>()
   let syncing = false
+  let active = true
 
   const remove = (agent: Agent): void => {
     const current = installed.get(agent)
@@ -184,25 +205,34 @@ export function installReadImageEnhancement(
     current.dispose()
   }
 
-  const syncAgent = (agent: Agent): void => {
+  const syncAgent = (agent: Agent, refresh: boolean): void => {
     const current = installed.get(agent)
-    const original = ctx.tools.get(READ_IMAGE_TOOL_NAME)
-    if (!policy.snapshot().modifyReadImage || original === undefined) {
+    if (!policy.snapshot().modifyReadImage) {
       remove(agent)
       return
     }
-    if (current?.original === original) return
+    if (current !== undefined && !refresh) return
     if (current !== undefined) remove(agent)
-    if (ctx.tools.get(READ_IMAGE_TOOL_NAME, agent) !== original) return
-    const dispose = agent.ctx.tools.register(enhancedReadImageTool(ctx, original, publicHttpRuntime))
+    // Resolve the definition this exact agent inherits. Newer DSH presets may
+    // contribute filesystem tools from an ancestor scope instead of the global
+    // layer; registering into agent.ctx then shadows either form uniformly.
+    const original = ctx.tools.get(READ_IMAGE_TOOL_NAME, agent)
+    if (original === undefined) return
+    let dispose: () => void
+    try {
+      dispose = agent.ctx.tools.register(enhancedReadImageTool(ctx, original, publicHttpRuntime))
+    } catch (error: unknown) {
+      if (isInactiveEffect(error)) return
+      throw error
+    }
     installed.set(agent, { original, dispose })
   }
 
-  const syncAll = (): void => {
-    if (syncing) return
+  const syncAll = (refresh = false): void => {
+    if (!active || syncing) return
     syncing = true
     try {
-      for (const agent of ctx.agents.list()) syncAgent(agent)
+      for (const agent of ctx.agents.list()) syncAgent(agent, refresh)
       for (const agent of [...installed.keys()]) {
         if (ctx.agents.get(agent.id) !== agent) remove(agent)
       }
@@ -211,12 +241,15 @@ export function installReadImageEnhancement(
     }
   }
 
-  ctx.on('agent/created', ({ agent }) => { syncAgent(agent) })
+  // Reconcile through syncAll so the tools/change emitted by a scoped
+  // registration cannot re-enter before its installed record is committed.
+  ctx.on('agent/created', () => { syncAll(); return undefined })
   ctx.on('agent/disposed', ({ agent }) => { installed.delete(agent) })
-  ctx.on('tools/change', syncAll)
-  const stopPolicy = policy.watchImagePreferences(syncAll)
+  ctx.on('tools/change', () => { syncAll(true) })
+  const stopPolicy = policy.watchImagePreferences(() => { syncAll() })
   syncAll()
   ctx.effect(() => () => {
+    active = false
     stopPolicy()
     for (const agent of [...installed.keys()]) remove(agent)
   }, 'dsh-openai-codex: enhanced read_image')

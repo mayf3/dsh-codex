@@ -10,13 +10,17 @@ import {
   OPENAI_CODEX_AUTH_LOGOUT_PATH,
   OpenAICodexWebAuth,
   OPENAI_CODEX_AUTH_STATUS_PATH,
+  OPENAI_CODEX_CONTEXT_WINDOW_SETTINGS_PATH,
+  OPENAI_CODEX_IMAGE_TOOL_SETTINGS_PATH,
   OPENAI_CODEX_MODEL_CATALOG_SETTINGS_PATH,
+  OPENAI_CODEX_MODEL_FALLBACK_SETTINGS_PATH,
+  OPENAI_CODEX_PROXY_SETTINGS_PATH,
   REMOTE_WEB_ORIGIN_NOT_TRUSTED,
   registerOpenAICodexAuthRoutes,
   trustedRequestDecision,
 } from '../src/auth-routes.ts'
 import type { OpenAICodexCredentialStore } from '../src/store.ts'
-import type { ImageToolPolicy } from '../src/tool-policy.ts'
+import type { ImageToolPolicy, ImageToolPreferences } from '../src/tool-policy.ts'
 import { OpenAICodexTrustedOriginsStore } from '../src/trusted-origins.ts'
 import {
   OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE,
@@ -74,6 +78,10 @@ interface CapturedRoute {
 function captureRoutes(
   trustedOrigins: OpenAICodexTrustedOriginsStore = emptyTrustedOrigins,
   preferences?: ImageToolPolicy,
+  proxySettings?: {
+    proxyPreferences(): { proxyMode: 'off' | 'scoped' | 'global'; proxyUrl: string }
+    updateProxyPreferences(patch: Partial<{ proxyMode: 'off' | 'scoped' | 'global'; proxyUrl: string }>): Promise<{ proxyMode: 'off' | 'scoped' | 'global'; proxyUrl: string }>
+  },
 ): CapturedRoute[] {
   const routes: CapturedRoute[] = []
   const ctx = {
@@ -87,7 +95,7 @@ function captureRoutes(
       return factory()
     },
   } as unknown as Context
-  registerOpenAICodexAuthRoutes(ctx, store, trustedOrigins, undefined, preferences)
+  registerOpenAICodexAuthRoutes(ctx, store, trustedOrigins, undefined, preferences, proxySettings)
   return routes
 }
 
@@ -139,11 +147,41 @@ afterEach(async () => {
 })
 
 describe('OpenAI Codex Web OAuth boundary', () => {
+  it('serves and validates the three-state proxy settings', async () => {
+    let current = { proxyMode: 'off' as 'off' | 'scoped' | 'global', proxyUrl: '' }
+    const proxySettings = {
+      proxyPreferences: vi.fn(() => ({ ...current })),
+      updateProxyPreferences: vi.fn(async (patch: Partial<typeof current>) => {
+        current = { ...current, ...patch }
+        return { ...current }
+      }),
+    }
+    const route = captureRoutes(emptyTrustedOrigins, undefined, proxySettings)
+      .find(candidate => candidate.path === OPENAI_CODEX_PROXY_SETTINGS_PATH)
+    if (route === undefined) throw new Error('proxy settings route was not registered')
+
+    const getResponse = response()
+    await route.handler(request({}), getResponse)
+    expect(JSON.parse(getResponse.observed.body ?? 'null')).toEqual({ proxyMode: 'off', proxyUrl: '' })
+
+    const postResponse = response()
+    await route.handler(request({
+      method: 'POST',
+      body: JSON.stringify({ proxyMode: 'scoped', proxyUrl: 'http://127.0.0.1:7890' }),
+    }), postResponse)
+    expect(postResponse.observed.status).toBe(200)
+    expect(current).toEqual({ proxyMode: 'scoped', proxyUrl: 'http://127.0.0.1:7890' })
+
+    const invalidResponse = response()
+    await route.handler(request({ method: 'POST', body: JSON.stringify({ proxyMode: 'sometimes' }) }), invalidResponse)
+    expect(invalidResponse.observed.status).toBe(400)
+  })
+
   it('serves and updates the model discovery subset through the plugin settings route', async () => {
     const snapshot = {
       availableModels: [
-        { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
-        { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' },
+        { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', contextWindow: 272_000 },
+        { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: 272_000 },
       ],
       models: ['gpt-5.6-luna', 'gpt-5.6-sol'],
     }
@@ -169,6 +207,110 @@ describe('OpenAI Codex Web OAuth boundary', () => {
     expect(postResponse.observed.status).toBe(200)
     expect(updateModelCatalog).toHaveBeenCalledWith({ models: ['gpt-5.6-sol'] })
     expect(JSON.parse(postResponse.observed.body ?? 'null').models).toEqual(['gpt-5.6-sol'])
+  })
+
+  it('serves and validates the automatic model fallback toggle', async () => {
+    let automaticModelFallback = false
+    const preferences = {
+      modelFallbackSnapshot: vi.fn(() => ({ automaticModelFallback })),
+      updateModelFallback: vi.fn(async (patch: { automaticModelFallback?: boolean }) => {
+        if (patch.automaticModelFallback !== undefined) {
+          automaticModelFallback = patch.automaticModelFallback
+        }
+        return { automaticModelFallback }
+      }),
+    } as unknown as ImageToolPolicy
+    const route = captureRoutes(emptyTrustedOrigins, preferences)
+      .find(candidate => candidate.path === OPENAI_CODEX_MODEL_FALLBACK_SETTINGS_PATH)
+    if (route === undefined) throw new Error('model fallback settings route was not registered')
+
+    const getResponse = response()
+    await route.handler(request({}), getResponse)
+    expect(JSON.parse(getResponse.observed.body ?? 'null')).toEqual({ automaticModelFallback: false })
+
+    const postResponse = response()
+    await route.handler(request({
+      method: 'POST',
+      body: JSON.stringify({ automaticModelFallback: true }),
+    }), postResponse)
+    expect(postResponse.observed.status).toBe(200)
+    expect(automaticModelFallback).toBe(true)
+
+    const invalidResponse = response()
+    await route.handler(request({
+      method: 'POST',
+      body: JSON.stringify({ automaticModelFallback: 'yes' }),
+    }), invalidResponse)
+    expect(invalidResponse.observed.status).toBe(400)
+  })
+
+  it('serves and validates the image generation model', async () => {
+    let current: ImageToolPreferences = {
+      modifyReadImage: true,
+      shareImagegenWithOtherModels: true,
+      imageGenerationModel: 'gpt-image-2',
+    }
+    const preferences = {
+      snapshot: vi.fn(() => ({ ...current })),
+      update: vi.fn(async (patch: Partial<typeof current>) => {
+        current = { ...current, ...patch }
+        return { ...current }
+      }),
+    } as unknown as ImageToolPolicy
+    const route = captureRoutes(emptyTrustedOrigins, preferences)
+      .find(candidate => candidate.path === OPENAI_CODEX_IMAGE_TOOL_SETTINGS_PATH)
+    if (route === undefined) throw new Error('image settings route was not registered')
+
+    const updateResponse = response()
+    await route.handler(request({
+      method: 'POST',
+      body: JSON.stringify({ imageGenerationModel: 'gpt-image-2.5-flare' }),
+    }), updateResponse)
+    expect(updateResponse.observed.status).toBe(200)
+    expect(current.imageGenerationModel).toBe('gpt-image-2.5-flare')
+
+    const invalidResponse = response()
+    await route.handler(request({
+      method: 'POST',
+      body: JSON.stringify({ imageGenerationModel: 'gpt-image-future' }),
+    }), invalidResponse)
+    expect(invalidResponse.observed.status).toBe(400)
+  })
+
+  it('serves, updates, resets, and validates the context-window override', async () => {
+    let contextWindow: number | null = null
+    const preferences = {
+      contextWindowSnapshot: vi.fn(() => ({ contextWindow })),
+      updateContextWindow: vi.fn(async (patch: { contextWindow?: number | null }) => {
+        if (patch.contextWindow !== undefined) contextWindow = patch.contextWindow
+        return { contextWindow }
+      }),
+    } as unknown as ImageToolPolicy
+    const route = captureRoutes(emptyTrustedOrigins, preferences)
+      .find(candidate => candidate.path === OPENAI_CODEX_CONTEXT_WINDOW_SETTINGS_PATH)
+    if (route === undefined) throw new Error('context-window settings route was not registered')
+
+    const getResponse = response()
+    await route.handler(request({}), getResponse)
+    expect(JSON.parse(getResponse.observed.body ?? 'null')).toEqual({
+      contextWindow: null,
+    })
+
+    const updateResponse = response()
+    await route.handler(request({ method: 'POST', body: JSON.stringify({ contextWindow: 512_000 }) }), updateResponse)
+    expect(updateResponse.observed.status).toBe(200)
+    expect(contextWindow).toBe(512_000)
+
+    const resetResponse = response()
+    await route.handler(request({ method: 'POST', body: JSON.stringify({ contextWindow: null }) }), resetResponse)
+    expect(resetResponse.observed.status).toBe(200)
+    expect(contextWindow).toBeNull()
+
+    for (const value of [0, 1.5, '272000']) {
+      const invalidResponse = response()
+      await route.handler(request({ method: 'POST', body: JSON.stringify({ contextWindow: value }) }), invalidResponse)
+      expect(invalidResponse.observed.status).toBe(400)
+    }
   })
 
   it('returns a stable remote-origin error until the exact effective origin is trusted', async () => {
@@ -285,10 +427,10 @@ describe('OpenAI Codex Web OAuth boundary', () => {
     interaction.notify({ type: 'auth_url', url: 'https://auth.openai.com/authorize' })
 
     await expect(Promise.all([first, second])).resolves.toEqual([
-      { url: 'https://auth.openai.com/authorize' },
-      { url: 'https://auth.openai.com/authorize' },
+      { method: 'browser', url: 'https://auth.openai.com/authorize' },
+      { method: 'browser', url: 'https://auth.openai.com/authorize' },
     ])
-    await expect(auth.signIn()).resolves.toEqual({ url: 'https://auth.openai.com/authorize' })
+    await expect(auth.signIn()).resolves.toEqual({ method: 'browser', url: 'https://auth.openai.com/authorize' })
     expect(mocked.login).toHaveBeenCalledOnce()
     completion.resolve()
     await completion.promise
@@ -383,7 +525,7 @@ describe('OpenAI Codex Web OAuth boundary', () => {
     if (interaction === undefined) throw new Error('login interaction was not captured')
     interaction.notify({ type: 'auth_url', url: 'https://auth.openai.com/authorize' })
 
-    await expect(challenge).resolves.toEqual({ url: 'https://auth.openai.com/authorize' })
+    await expect(challenge).resolves.toEqual({ method: 'browser', url: 'https://auth.openai.com/authorize' })
     await vi.waitFor(() => { expect(interaction?.signal?.aborted).toBe(true) })
     await auth.dispose()
     await expect(auth.status()).resolves.toEqual({
@@ -406,6 +548,39 @@ describe('OpenAI Codex Web OAuth boundary', () => {
       usage: { rateLimits: [] },
     })
     expect(mocked.status).toHaveBeenCalled()
+  })
+
+  it('cancels a pending login without deleting the credential', async () => {
+    mocked.login.mockImplementation((interaction: AuthInteraction) => abortableLogin(interaction))
+    const auth = new OpenAICodexWebAuth(store)
+    const challenge = auth.signIn('device_code')
+    await auth.cancel()
+    await expect(challenge).rejects.toThrow(/sign-in cancelled/u)
+    expect(mocked.logout).not.toHaveBeenCalled()
+    await expect(auth.status()).resolves.toEqual({ status: 'signed-out' })
+  })
+
+  it('accepts a device-code challenge and reads a credential written after an earlier error', async () => {
+    let interaction: AuthInteraction | undefined
+    mocked.login.mockImplementation((next: AuthInteraction) => {
+      interaction = next
+      return abortableLogin(next)
+    })
+    const auth = new OpenAICodexWebAuth(store, { challengeTimeoutMs: 5 })
+    const failed = auth.signIn()
+    await expect(failed).rejects.toThrow(/authorization URL/u)
+    await auth.dispose()
+    mocked.login.mockImplementation((next: AuthInteraction) => {
+      interaction = next
+      return abortableLogin(next)
+    })
+    const challenge = auth.signIn('device_code')
+    if (interaction === undefined) throw new Error('login interaction was not captured')
+    interaction.notify({ type: 'device_code', verificationUri: 'https://auth.openai.com/codex/device', userCode: 'ABCD-EFGH', expiresInSeconds: 900 })
+    await expect(challenge).resolves.toEqual({ method: 'device_code', verificationUri: 'https://auth.openai.com/codex/device', userCode: 'ABCD-EFGH', expiresInSeconds: 900 })
+    await auth.dispose()
+    mocked.status.mockResolvedValue({ authenticated: true })
+    await expect(auth.status()).resolves.toEqual({ status: 'signed-in', usage: { rateLimits: [] } })
   })
 
   it('reports reauth-required without logging out or starting OAuth', async () => {

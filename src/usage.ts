@@ -1,9 +1,9 @@
 /** Live ChatGPT Codex rate-limit usage for the browser account page. */
 
 import { createModels } from '@earendil-works/pi-ai'
-import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
+import { openaiCodexProvider } from './oauth-provider.ts'
 import type { OpenAICodexCredentialStore } from './store.ts'
-import { OPENAI_CODEX_PROVIDER } from './store.ts'
+import { OpenAICodexReauthRequiredError, OpenAICodexRefreshInProgressError, OPENAI_CODEX_PROVIDER } from './store.ts'
 
 /** Fixed endpoint used by the official Codex client for ChatGPT rate limits. */
 export const OPENAI_CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -22,15 +22,7 @@ export const OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE = 'OpenAI Codex authorization 
  * The error intentionally carries no response, credential, or account data so
  * callers can safely pass its fixed message across the Web boundary.
  */
-export class OpenAICodexReauthRequiredError extends Error {
-  readonly code = OPENAI_CODEX_REAUTH_REQUIRED_CODE
-
-  constructor() {
-    super(OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE)
-    this.name = 'OpenAICodexReauthRequiredError'
-  }
-}
-
+export { OpenAICodexReauthRequiredError } from './store.ts'
 /** Identify the dedicated reauthorization failure without comparing messages. */
 export function isOpenAICodexReauthRequiredError(error: unknown): error is OpenAICodexReauthRequiredError {
   return error instanceof OpenAICodexReauthRequiredError
@@ -76,6 +68,21 @@ export interface OpenAICodexIndividualLimit {
   readonly remainingPercent: number
 }
 
+/** Backend-owned model recovery instructions understood by the current Codex client. */
+export type OpenAICodexRateLimitUpsell =
+  | {
+      readonly kind: 'luna-reserve'
+      /** Optional model whose current allowance is exhausted. */
+      readonly blockedModelSlug?: string
+    }
+  | {
+      readonly kind: 'model-recovery'
+      /** Exact model whose current allowance is exhausted. */
+      readonly blockedModelSlug: string
+      /** Ordered replacement models selected by the backend. */
+      readonly fallbackModelSlugs: readonly string[]
+    }
+
 /** Secret-free quota projection returned to the browser. */
 export interface OpenAICodexUsage {
   /** Rolling Codex rate-limit buckets. */
@@ -84,6 +91,8 @@ export interface OpenAICodexUsage {
   readonly credits?: OpenAICodexCredits
   /** Exact workspace member limit when supported for this account. */
   readonly individualLimit?: OpenAICodexIndividualLimit
+  /** Optional backend-owned fallback instructions for exhausted models. */
+  readonly rateLimitUpsell?: OpenAICodexRateLimitUpsell
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -179,6 +188,47 @@ function parseIndividualLimit(value: unknown): OpenAICodexIndividualLimit | unde
   }
 }
 
+function boundedSlug(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256
+    || /\p{Cc}/u.test(value)) {
+    throw new Error(`OpenAI Codex returned an invalid ${field}`)
+  }
+  return value
+}
+
+/** Preserve only the known backend fields needed for automatic model recovery. */
+function parseRateLimitUpsell(value: unknown): OpenAICodexRateLimitUpsell | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!isRecord(value)) return undefined
+  const bannerType = value['banner_type']
+  if (bannerType !== 'luna_reserve' && bannerType !== 'model_recovery') return undefined
+  const fallbackModelSlugs = value['fallback_model_slugs']
+  try {
+    const blockedModelSlug = boundedSlug(value['blocked_model_slug'], 'blocked model slug')
+    if (bannerType === 'luna_reserve') {
+      return {
+        kind: 'luna-reserve',
+        ...blockedModelSlug === undefined ? {} : { blockedModelSlug },
+      }
+    }
+    if (blockedModelSlug === undefined
+      || !Array.isArray(fallbackModelSlugs)
+      || fallbackModelSlugs.length === 0
+      || fallbackModelSlugs.length > 16) return undefined
+    const fallback = fallbackModelSlugs.map(slug => boundedSlug(slug, 'fallback model slug'))
+    if (fallback.some(slug => slug === undefined)) return undefined
+    return {
+      kind: 'model-recovery',
+      blockedModelSlug,
+      fallbackModelSlugs: fallback as string[],
+    }
+  } catch {
+    // Usage remains useful when a newer backend ships an unsupported banner shape.
+    return undefined
+  }
+}
+
 /**
  * Convert the provider response into the small secret-free object sent to the browser.
  * @param value - opaque JSON returned by the ChatGPT usage endpoint.
@@ -209,10 +259,12 @@ export function parseOpenAICodexUsage(value: unknown): OpenAICodexUsage {
   }
   const credits = parseCredits(value['credits'])
   const individualLimit = parseIndividualLimit(value['spend_control'])
+  const rateLimitUpsell = parseRateLimitUpsell(value['rate_limit_upsell'])
   return {
     rateLimits: limits,
     ...credits === undefined ? {} : { credits },
     ...individualLimit === undefined ? {} : { individualLimit },
+    ...rateLimitUpsell === undefined ? {} : { rateLimitUpsell },
   }
 }
 
@@ -224,17 +276,29 @@ export function parseOpenAICodexUsage(value: unknown): OpenAICodexUsage {
  */
 export async function readOpenAICodexRateLimits(
   store: OpenAICodexCredentialStore,
+  requestFetch: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<OpenAICodexUsage> {
   const models = createModels({ credentials: store })
-  models.setProvider(openaiCodexProvider())
-  const auth = await models.getAuth(OPENAI_CODEX_PROVIDER)
+  models.setProvider(openaiCodexProvider(requestFetch))
+  const auth = await models.getAuth(OPENAI_CODEX_PROVIDER).catch((error: unknown) => {
+    // pi-ai preserves store failures as Error.cause; keep the public store
+    // identity at this consumer boundary, including bounded refresh waits.
+    const seen = new Set<Error>()
+    let cause: unknown = error
+    while (cause instanceof Error && !seen.has(cause)) {
+      if (cause instanceof OpenAICodexReauthRequiredError || cause instanceof OpenAICodexRefreshInProgressError) throw cause
+      seen.add(cause)
+      cause = cause.cause
+    }
+    throw error
+  })
   const credential = await store.read(OPENAI_CODEX_PROVIDER)
   const access = auth?.auth.apiKey
   const accountId = credential?.type === 'oauth' ? credential.accountId : undefined
   if (access === undefined || access.length === 0 || typeof accountId !== 'string' || accountId.length === 0) {
     throw new Error('OpenAI Codex is signed out')
   }
-  const response = await fetch(OPENAI_CODEX_USAGE_URL, {
+  const response = await requestFetch(OPENAI_CODEX_USAGE_URL, {
     method: 'GET',
     redirect: 'error',
     headers: {

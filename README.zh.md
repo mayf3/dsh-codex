@@ -2,18 +2,23 @@
 
 [English](README.md) | 中文
 
+**[迁移指南：修复 dsh-codex 0.3.0 之前版本写入的历史 Session](docs/session-repair.zh.md)**
+
 通过 OpenAI Codex 登录流程，在 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 中使用 ChatGPT 订阅：无需 OpenAI Platform API Key，也无需修改 dsh 源码。
 
 `dsh-codex` 是一个独立的 dsh bundle，提供：
 
 - 在 dsh 设置面板或独立 CLI 中完成 ChatGPT OAuth 登录，并自动刷新 token
 - Codex GPT 模型目录；账号提供视觉模型时自动声明其图片输入能力
+- 可实时覆盖 dsh 用于上下文用量显示与压缩策略的客户端窗口容量
 - 经标准 LLM 服务运行的流式响应、工具调用、推理回放、提示词缓存与 dsh 压缩
 - 通过 dsh 现有 `web_search` 工具使用 Codex 独立联网搜索
 - 为 Harness 现有 `read_image` 工具增加可选的 HTTP(S) URL 输入
-- 由 `gpt-image-2` 执行的 `imagegen` 工具，支持工作区／会话参考图和自动工作区输出
+- 可选择 GPT Image 后端的 `imagegen` 工具，支持工作区／会话参考图和自动工作区输出
 - 复用 dsh Web 输入框的粘贴和拖放图片能力
 - 在 Web 输入框提供按会话生效的 Fast Mode 开关与紧凑的每周额度指示器
+- 可选的后端授权模型恢复，包括隐藏的 Luna Reserve 路由
+- 可选择仅 Codex 或整个进程范围的三态 HTTP(S) 代理设置
 
 ChatGPT 订阅认证与按量计费的 OpenAI API 是不同产品。本插件只使用 ChatGPT Codex 后端，不会把订阅转换成通用 OpenAI API 凭据。
 
@@ -28,18 +33,18 @@ dsh web
 
 从 DeepSeek Harness 源码 checkout 运行时，使用 `pnpm dsh plugin --profile web add dsh-codex`。开发插件时仍可用 `link:/absolute/path/to/dsh-codex` 安装本地 checkout。
 
-打开 **设置 → OpenAI Codex → 使用 ChatGPT 登录**。插件会打开 OpenAI 授权页面，并通过 localhost 回调完成登录。账号页面会显示实时 Codex 额度进度条与精确剩余百分比；只有账号接口提供信用余额或工作区限额时，才会一并显示精确数值。
+打开 **设置 → OpenAI Codex**，选择 **浏览器登录** 或 **设备码登录**。浏览器登录会给出授权链接；点击后在系统浏览器完成授权。当浏览器和 dsh 宿主位于同一台机器时，localhost 回调会完成登录；远端浏览器可以使用设备码。账号页面会显示实时 Codex 额度进度条与精确剩余百分比；只有账号接口提供信用余额或工作区限额时，才会一并显示精确数值。
 
-回环地址上的 Web 页面会自动受信任。若 dsh 运行在另一台机器上，账号页面会显示需要在 dsh 主机执行的精确 origin 授权命令，例如 `dsh plugin --profile web exec dsh-openai-codex trust-origin http://host:port`。allowlist 按完整 origin 匹配，与 OAuth 凭据分开保存，并可通过 `trusted-origins` 和 `untrust-origin` 查看或撤销。
+回环地址上的 Web 页面会自动受信任。若 dsh 运行在另一台机器上，账号页面会显示需要在 dsh 主机执行的精确 origin 授权命令，例如 `dsh plugin --profile web exec dsh-codex trust-origin http://host:port`。allowlist 按完整 origin 匹配，与 OAuth 凭据分开保存，并可通过 `trusted-origins` 和 `untrust-origin` 查看或撤销。
 
 终端和无界面环境仍可使用 CLI：
 
 ```sh
-dsh plugin --profile web exec dsh-openai-codex login
-dsh plugin --profile web exec dsh-openai-codex login --device-code
-dsh plugin --profile web exec dsh-openai-codex status
-dsh plugin --profile web exec dsh-openai-codex doctor --json
-dsh plugin --profile web exec dsh-openai-codex logout
+dsh plugin --profile web exec dsh-codex login
+dsh plugin --profile web exec dsh-codex login --device-code
+dsh plugin --profile web exec dsh-codex status
+dsh plugin --profile web exec dsh-codex doctor --json
+dsh plugin --profile web exec dsh-codex logout
 ```
 
 在 `dsh-tui` 中使用时，把 bundle 安装到同一个 profile：
@@ -48,13 +53,21 @@ dsh plugin --profile web exec dsh-openai-codex logout
 dsh plugin --profile dsh-tui add dsh-codex
 ```
 
-重新启动 TUI 后，`/model` 会列出 `openai-codex` 的模型；没有显式模型配置或已保存选择时，TUI 会采用 bundle 注册的 `gpt-5.6-sol`。`/codex status|login|logout|usage|config` 用于管理账号与查看配置，四个布尔开关可通过 `/codex set <read-image|imagegen-other-models|websocket-context|native-compaction> <on|off>` 修改。浏览器登录完成后，凭据与 Web profile 共用同一份 dsh 凭据文件。
+重新启动 TUI 后，`/model` 会列出 `openai-codex` 的模型；没有显式模型配置或已保存选择时，TUI 会采用 bundle 注册的 `gpt-5.6-sol`。`/codex status|login|logout|usage|config` 用于管理账号与查看配置；`/codex set backend-fallback on|off` 控制自动模型恢复，其余开关可通过 `/codex set` 查看。`/codex login` 会给出浏览器链接，远端终端可用 `/codex login device` 获取设备码。TUI 的 `/settings` 也通过同一个 dsh 设置命名空间编辑 Codex 的标量设置；模型可见性与代理 URL 仍在 Web 设置页编辑。两个界面共用凭据和实时偏好。
 
 Codex、Claude Code 及其他自动化 agent 应直接遵循 [INSTALL.md](INSTALL.md)。它是一份完整且可重复执行的 runbook，不要求安装者阅读源码或设计文档。
 
 bundle 会为新建 agent 选择 `openai-codex` / `gpt-5.6-sol`，并选择 Codex 搜索提供方。dsh settings 中已经保存的模型仍然优先；模型选择器可以切换到当前账号可用的其他 Codex 模型。
 
+自动模型回退默认关闭。启用 **设置 → OpenAI Codex** 中的开关后，插件只会遵循 OpenAI 为当前账号返回的恢复指令：普通恢复按后端给出的替代模型顺序选择；`luna_reserve` 指令则解析官方隐藏的 `gpt-reserve` 路由，并沿用 Luna 的上下文、推理与图片能力。该决定发生在 dsh 准备重试之前，因此实际模型、上下文预算、图片准入与 Session 请求头保持一致。视觉路由绝不会回退到纯文本模型，附件、`read_image` 与 `imagegen` 会继续可用。没有兼容回退或额度刷新失败时，原始额度错误会继续交给 Harness 的正常重试路径。`imagegen` 与该切换相互独立，并使用设置页中选定的图片后端。
+
 ## 模型目录
+
+插件会读取 Codex CLI/Desktop 的 `models_cache.json`，补充 pi-ai 尚未收录的新模型，并使用缓存中的名称、输入能力、推理档位和默认 `context_window`。查找顺序为 `DSH_CODEX_MODELS_CACHE` 指定的文件、`CODEX_HOME/models_cache.json`、`~/.codex/models_cache.json`。只导入 `visibility: list` 的有效条目；缓存中声明的最大可扩展窗口不会自动替换默认容量。
+
+缓存由 Codex CLI/Desktop 刷新；模型发现只读取模型元数据，不依赖启动 Codex 子进程。除非显式配置 `credentialFile`（见下文），OAuth 登录仍相互独立。更新 Codex 并打开一次后，再打开插件模型设置或刷新模型列表即可发现变化。缓存缺失、损坏或正在写入时保留最近可用目录；首次启动没有缓存时使用随包目录（含 GPT-6 Astra、Sol 与 Luna）。目录元数据不保证当前 dsh 登录账号拥有相应模型权限。
+
+已保存的模型选择会保留。新增模型可以在下面的设置中启用；缓存暂时不可用不会删除已保存的模型 ID。新发现模型若没有随包价格信息，用量价格估算为 0，不能把它理解为该模型免费。
 
 默认情况下，模型选择器会展示完整的 `openai-codex` 目录。打开 **设置 → OpenAI Codex**，通过模型复选框选择需要显示的条目。该选择实时生效并持久保存；修改后 dsh 会刷新 Web 与 TUI 的模型目录。
 
@@ -64,12 +77,35 @@ bundle 会为新建 agent 选择 `openai-codex` / `gpt-5.6-sol`，并选择 Code
 - id: llm-openai-codex
   config:
     models:
-      - gpt-5.6-luna
-      - gpt-5.6-sol
-      - gpt-5.6-terra
+      - gpt-6-luna
+      - gpt-6-sol
 ```
 
 复选框与 `models` 设置都只控制模型发现。现有会话已经保存或显式指定的隐藏模型仍可解析，因此收窄选择器不会破坏旧记录。省略 `models` 时初始展示完整目录；空列表表示不展示任何模型。
+
+## 上下文窗口
+
+打开 **设置 → OpenAI Codex → 上下文窗口**，可以用 K tokens 为单位覆盖客户端容量。例如输入 `512` 表示 512,000 tokens；留空会恢复各模型在 pi-ai 目录中的默认值。保存后的值会在下一次请求时应用到全部 Codex 模型，并显示在 `/codex config` 中；已打开会话的用量分母会在该请求后刷新。
+
+也可以在初始配置中填写精确 token 数：
+
+```yaml
+- id: llm-openai-codex
+  config:
+    contextWindow: 512000
+```
+
+该功能在 Harness 一侧对应 Codex CLI 的 `model_context_window` 概念，不会向 Responses 端点发送上下文窗口字段。解析后的容量会直接控制 dsh 的上下文用量分母、溢出判断、输出 token 收缩和自动压缩阈值；较小的值会更早压缩。较大的值不会提高后端模型的真实容量，模型不支持时仍可能返回上下文溢出错误。
+
+## 网络代理
+
+打开 **设置 → OpenAI Codex → 网络代理**，可以选择三种范围：
+
+- **跟随 dsh** 不由插件覆盖网络设置；Codex 继承 dsh 启动时已经配置的进程级代理。
+- **仅 Codex** 把所选代理用于 Codex 模型 SSE 请求、原生压缩、独立搜索、生图、额度读取，以及从设置页或 TUI 发起的 OAuth 登录和刷新；WebSocket 与独立 CLI 登录仍遵循进程策略。
+- **整个 dsh** 把代理应用到整个进程，并覆盖 OAuth；其他插件的请求也会受影响。关闭后会恢复插件覆盖前的宿主策略。
+
+代理 URL 支持 `http://` 与 `https://`。留空时依次使用 `DSH_CODEX_PROXY`，以及标准的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 环境变量。默认模式是 **跟随 dsh**，因此安装插件不会静默改变整个进程的 dispatcher。
 
 ## 图片
 
@@ -81,13 +117,13 @@ bundle 会为新建 agent 选择 `openai-codex` / `gpt-5.6-sol`，并选择 Code
 - 在当前 dsh 附件限制内支持 PNG、JPEG、WebP 与 GIF；
 - 只有明确声明支持图片输入的模型才能接收图片。
 
-任何支持视觉输入的当前对话模型都可以使用 `imagegen`。当前模型只需编写普通提示词，并在 `referenced_image_paths` 与 `num_last_images_to_include` 中选择一种参考图来源；插件从 `ctx.fs` 或附件存储读取字节，再发送给 `gpt-image-2`。模型不会输出 base64。每个结果都会直接显示在对话中、保存为持久附件，并写入当前工作区。`output_path` 用来指定位置；省略时会创建唯一的 `generated-<时间戳>-<id>.png` 文件。本地保存能力包含在本插件中；当工作区由 `dsh-remote-ssh` 管理时，远程插件负责 AHP 写入路径。
+任何支持视觉输入的当前对话模型都可以使用 `imagegen`。当前模型只需编写普通提示词，并在 `referenced_image_paths` 与 `num_last_images_to_include` 中选择一种参考图来源；插件从 `ctx.fs` 或附件存储读取字节，再发送给配置的 GPT Image 后端。模型不会输出 base64。每个结果都会直接显示在对话中、保存为持久附件，并写入当前工作区。`output_path` 用来指定位置；省略时会创建唯一的 `generated-<时间戳>-<id>.png` 文件。本地保存能力包含在本插件中；当工作区由 `dsh-remote-ssh` 管理时，远程插件负责 AHP 写入路径。
 
-设置页提供独立的 **增强 read_image** 与 **允许其他模型使用生图** 开关，默认均为开启。关闭第一项会撤销插件的 agent-scope 覆盖，恢复 Harness 原本只接受本地路径的 `read_image` Schema。关闭第二项后，Codex 视觉模型仍可使用 `imagegen`，其他模型提供方的调用会在执行入口被拒绝。
+设置页可选择 `gpt-image-2`（当前 Codex 默认）、`gpt-image-2.5`、`gpt-image-2.5-sunburst` 或 `gpt-image-2.5-flare`，并提供独立的 **增强 read_image** 与 **允许其他模型使用生图** 开关，两个开关默认开启。关闭第一项会撤销插件的 agent-scope 覆盖，恢复 Harness 原本只接受本地路径的 `read_image` Schema。关闭第二项后，Codex 视觉模型仍可使用 `imagegen`，其他模型提供方的调用会在执行入口被拒绝。
 
 `read_image` 在返回实际图片块之前，会先验证图片并把字节持久化为 dsh 附件。本地路径原样委托给 Harness，继续沿用当前文件系统和沙箱行为；URL 扩展会限制重定向次数与下载字节数，拒绝内嵌凭据和本地／私网／特殊网络目标，并在每一跳把连接固定到已经验证的公网地址。
 
-对符合条件的 Codex GPT 会话，Web 输入框还会显示仅对当前会话生效的 Fast Mode 开关。开启后只为该会话加入提供方的 priority service tier，不会修改已保存的模型设置；旁边的额度条显示对应的每周额度和提供方声明的重置时间。
+对符合条件的 Codex GPT 会话，Web 输入框还会显示仅对当前会话生效的 Fast Mode 开关。开启后只为该会话加入提供方的 priority service tier，不会修改已保存的模型设置；旁边的额度条显示对应的每周额度和提供方声明的重置时间。设置页另有默认关闭的 **默认强制开启 1.5 倍速** 开关，开启后所有会话默认使用 1.5 倍速，无需逐会话点击开关，但额度消耗更快。
 
 ## 搜索
 
@@ -109,7 +145,9 @@ bundle 会为新建 agent 选择 `openai-codex` / `gpt-5.6-sol`，并选择 Code
 | `searchContextSize` | `medium` | `low`、`medium`、`high` |
 | `searchMaxOutputTokens` | `10000` | 正整数 |
 
-每个已经解析默认值且不含凭据的辅助请求，都会在发送前记录为专用的 `web/openai-codex-search-llm-request` 会话事件。该事件由本插件拥有并注册，不需要通用搜索事件或 dsh fork。
+dsh-codex 0.3.0 不再写入已停用的 `web/openai-codex-search-llm-request` 事件。早期版本写入此外部事件时没有可忽略信封标记，后续 Harness 格式迁移可能因此拒绝原本完整的 Session。普通 `web_search` 调用与结果仍通过 Harness 现有的 `tool/call` 和 `tool/result` 事件持久化。
+
+受影响的用户应按**[历史 Session 修复指南](docs/session-repair.zh.md)**操作。命令默认只做 dry-run，保留源 generation，并要求停止 dsh 后显式传入 `--apply`。
 
 ## Responses API 实验功能
 
@@ -122,7 +160,7 @@ bundle 会为新建 agent 选择 `openai-codex` / `gpt-5.6-sol`，并选择 Code
 
 ## 凭据与隐私
 
-dsh 登录与 Codex CLI／Desktop 相互独立：
+dsh 登录默认与 Codex CLI／Desktop 相互独立：
 
 - 凭据存储于 `$DSH_HOME/.openai-codex-auth.json`，默认位于 `~/.dsh`；
 - 文件原子写入，token 刷新会在本地 dsh 进程之间加锁；
@@ -131,9 +169,15 @@ dsh 登录与 Codex CLI／Desktop 相互独立：
 
 分离存储可以避免两个客户端竞争同一个会轮换的 refresh token。移除 bundle 不会删除凭据；需要移除本地账号时，请使用账号页面或 `logout` 命令。
 
+若要共享现有登录，将插件配置 `credentialFile` 设为 JSON 文件的绝对路径，例如 `C:/Users/you/.codex/auth.json`。已有文件按形状识别：Codex 的 `tokens`、CPA/CLIProxyAPI 的 `type: codex`、OpenCode 的 `openai`、Pi 的 `openai-codex`、扁平 OAuth，以及 dsh 原生格式。不认识、有歧义、字段不完整或只有 API key 的文件会明确报错；文件不存在时创建 dsh 原生格式。请使用普通文件而非符号链接或硬链接，POSIX 下要求仅属主可读写。
+
+选中的凭据只允许包含已识别的字段；存在未知字段时，在刷新或写入前拒绝使用，诊断仅指出字段名、不输出字段值。更新保留识别出的布局、已知元数据和其他 provider 的独立条目。provider 专属 OAuth 刷新函数保留并写回新的 access、refresh、ID token，以及可获取的 email，不再使用 pi-ai 丢弃身份字段的 token 投影。登录复用 pi-ai 的交互流程，随后补一次完整刷新再保存。响应缺少 ID token 时明确失败，而非悄悄保留过时身份。退出登录只清空选中的 OAuth 字段，不删除整个共享文件，也会影响使用该登录的其他程序。
+
+显式共享文件仅做进程内串行化，不使用 `.lock` 或刷新意图协议。写入前重新读取文件，检测到同一凭据被其他写入者更新则报错。同目录临时文件替换可在支持该语义的本地文件系统上避免本插件写出半截 JSON，但不保证断电持久性或与其他程序互斥。同时刷新仍可能竞争，写后读回校验也无法解决这一点。默认独立 dsh 存储继续保留原有跨进程锁。
+
 ## 兼容性说明
 
-- 本分支面向 DSH `0.1.0-rc.7` 插件表层与 `@earendil-works/pi-ai` `0.82.1`。adapter 会在读取历史时迁移旧版 pi-ai replay envelope，因此升级到 rc.7 后，已有 reasoning／tool 元数据仍可继续使用。
+- 当前源码面向成套发布的 DSH `0.2.0-rc.1` 插件表层，并使用其正式的 volatile settings 与 `dsh-http-proxy` 实现。同时使用 `@earendil-works/pi-ai` `0.85.1`；adapter 仍会在读取历史时迁移旧版 pi-ai replay envelope，因此升级后已有 reasoning／tool 元数据可继续使用。
 - 插件只使用已发布的 dsh 插件表层，不要求修改版 Harness checkout。单独安装时即可生成附件并保存本地输出。
 - ChatGPT 套餐资格、模型权限、配额及后端行为由 OpenAI 控制，可能发生变化。
 - Codex 端点不执行普通 Responses 的 `max_output_tokens` 字段。压缩可以工作，但该路由无法在服务端落实配置的摘要上限。

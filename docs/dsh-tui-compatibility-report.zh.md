@@ -92,7 +92,7 @@ host 入口没有 Web 平台限制。`src/index.ts` 会注册：
 
 `dsh-tui/src/screens/Chat.tsx:774-787` 的 `/login` 只查看 `DEEPSEEK_API_KEY` 和 `DEEPSEEK_BASE_URL`，`/logout` 也只提示删除该环境变量。切换到 Codex 模型不会改变这两个命令的行为。
 
-`dsh-codex` 已提供独立的 `dsh-openai-codex login|logout|status`，但尚未向 DSH command registry 注册 `/codex` 一类的命令。因此 TUI 内找不到 ChatGPT 登录、登出、额度与实验开关。
+`dsh-codex` 已提供 profile 内的 `dsh-codex login|logout|status`，但尚未向 DSH command registry 注册 `/codex` 一类的命令。因此 TUI 内找不到 ChatGPT 登录、登出、额度与实验开关。
 
 ### 5. 图片能力在模型侧可用，在终端显示侧丢失
 
@@ -126,7 +126,7 @@ dsh plugin --profile dsh-tui add link:E:/source/ai/dsh/openai-codex
 
 ```powershell
 dsh --profile dsh-tui --dump-config
-dsh plugin --profile dsh-tui exec dsh-openai-codex status
+dsh plugin --profile dsh-tui exec dsh-codex status
 ```
 
 验收条件：
@@ -159,7 +159,7 @@ dsh plugin --profile dsh-tui exec dsh-openai-codex status
 
 使用单一 `/codex` 命名空间可以避开 TUI 现有 `/login`、`/logout` 的 DeepSeek 语义，也能被 Web 或其他命令型前端复用。命令返回普通 `CommandResult`，dsh-tui 已经会合并 command registry 中的外部命令。
 
-登录流程建议复用现有 OAuth 生命周期：打开系统浏览器、立即在命令结果中显示非敏感状态，回调完成后写入同一 credential store。登录操作需要由插件 lifecycle 持有，TUI 切会话时不能取消它。device-code 可以作为 `/codex login device` 的无浏览器路径。
+登录沿用同一份 OAuth 凭据：`/codex login browser` 显示授权链接，同机浏览器通过 localhost 回调完成；`/codex login device` 显示验证网址和设备码，适用于远端终端。登录操作由插件生命周期持有，TUI 切换会话不会取消它。
 
 这是 dsh-codex 仓库内收益最高的一项改动，也不需要依赖 dsh-tui 包。
 

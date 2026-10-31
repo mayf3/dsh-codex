@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { basename } from 'node:path'
 import { createModels } from '@earendil-works/pi-ai'
 import type { Models } from '@earendil-works/pi-ai'
-import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
+import { openaiCodexProvider } from './oauth-provider.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -19,11 +19,14 @@ import { writeWorkspaceBytes } from './binary-fs.ts'
 import { assertImageCapable } from './image-capability.ts'
 import { imageMediaType } from './read-image-enhancement.ts'
 import type { ImageToolPolicy } from './tool-policy.ts'
+import { DEFAULT_OPENAI_CODEX_IMAGE_MODEL } from './image-model.ts'
+import type { OpenAICodexImageModel } from './image-model.ts'
+import { OPENAI_CODEX_MESSAGE_SOURCE } from './message-source.ts'
 
 /** Stable Codex-compatible tool name. */
 export const IMAGEGEN_TOOL_NAME = 'imagegen'
 /** Image model selected by the official Codex image extension. */
-export const OPENAI_CODEX_IMAGE_MODEL = 'gpt-image-2'
+export const OPENAI_CODEX_IMAGE_MODEL = DEFAULT_OPENAI_CODEX_IMAGE_MODEL
 /** Standalone generation endpoint used by the official Codex client. */
 export const OPENAI_CODEX_IMAGE_GENERATIONS_URL = `${OPENAI_CODEX_BASE_URL}/images/generations`
 /** Reference-image edit endpoint used by the official Codex client. */
@@ -116,10 +119,16 @@ function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
 export class OpenAICodexImageClient {
   private readonly models: Models
 
-  /** @param credentials - shared refreshable OAuth store. */
-  constructor(credentials: OpenAICodexCredentialStore) {
+  /**
+   * @param credentials - shared refreshable OAuth store.
+   * @param requestFetch - request transport used after credentials resolve.
+   */
+  constructor(
+    credentials: OpenAICodexCredentialStore,
+    private readonly requestFetch: typeof globalThis.fetch = globalThis.fetch,
+  ) {
     const models = createModels({ credentials })
-    models.setProvider(openaiCodexProvider())
+    models.setProvider(openaiCodexProvider(requestFetch))
     this.models = models
   }
 
@@ -128,6 +137,7 @@ export class OpenAICodexImageClient {
     prompt: string,
     images: readonly string[],
     signal: AbortSignal,
+    model: OpenAICodexImageModel = OPENAI_CODEX_IMAGE_MODEL,
   ): Promise<Uint8Array> {
     throwIfAborted(signal)
     const auth = await abortable(this.models.getAuth(OPENAI_CODEX_PROVIDER), signal)
@@ -142,13 +152,13 @@ export class OpenAICodexImageClient {
       ...images.length === 0 ? {} : { images: images.map(image_url => ({ image_url })) },
       prompt,
       background: 'auto',
-      model: OPENAI_CODEX_IMAGE_MODEL,
+      model,
       quality: 'auto',
       size: 'auto',
     }
     let response: Response
     try {
-      response = await fetch(endpoint, {
+      response = await this.requestFetch(endpoint, {
         method: 'POST',
         redirect: 'error',
         headers: {
@@ -177,7 +187,7 @@ export class OpenAICodexImageClient {
         ? `OpenAI Codex image request failed (HTTP ${response.status})`
         : `OpenAI Codex image request failed (HTTP ${response.status}): ${detail}`
       throw new Error(response.status === 401 || response.status === 403
-        ? `${message}; run "dsh openai-codex login" again`
+        ? `${message}; run "dsh plugin --profile web exec dsh-codex login" again`
         : message)
     }
     if (!isRecord(payload) || !Array.isArray(payload['data'])) {
@@ -222,7 +232,6 @@ function contentOf(value: ImagegenValue): ContentBlock[] {
 function collectImageRefs(content: readonly ContentBlock[], output: ImageAttachmentRef[]): void {
   for (const block of content) {
     if (block.type === 'image') output.push(block.attachment)
-    else if (block.type === 'tool-result') collectImageRefs(block.content, output)
   }
 }
 
@@ -295,11 +304,12 @@ export function imagegenTool(
   ctx: Context,
   credentials: OpenAICodexCredentialStore,
   policy: ImageToolPolicy,
+  requestFetch: typeof globalThis.fetch = globalThis.fetch,
 ): ToolDefinition {
-  const client = new OpenAICodexImageClient(credentials)
+  const client = new OpenAICodexImageClient(credentials, requestFetch)
   return defineTool({
     name: IMAGEGEN_TOOL_NAME,
-    description: 'Generate or edit an image with gpt-image-2. Omit both reference fields for a new image. Use referenced_image_paths for workspace files, or num_last_images_to_include for attached, viewed, or previously generated conversation images. Never provide both. Multiple images keep chronological/path-array order; identify them as Image 1, Image 2, and so on in the prompt. The generated PNG is always saved in the active local or Remote SSH workspace; output_path chooses its location, otherwise a unique generated-<timestamp>-<id>.png name is used.',
+    description: 'Generate or edit an image with the GPT Image backend selected in OpenAI Codex settings. Omit both reference fields for a new image. Use referenced_image_paths for workspace files, or num_last_images_to_include for attached, viewed, or previously generated conversation images. Never provide both. Multiple images keep chronological/path-array order; identify them as Image 1, Image 2, and so on in the prompt. The generated PNG is always saved in the active local or Remote SSH workspace; output_path chooses its location, otherwise a unique generated-<timestamp>-<id>.png name is used.',
     parameters: {
       prompt: { type: 'string', required: true, description: 'Complete generation or edit instruction. For multiple references, name each input by its Image N order.' },
       referenced_image_paths: { type: 'array', items: { type: 'string' }, description: 'Up to five local or active-workspace image paths, in Image 1..N order.' },
@@ -348,7 +358,12 @@ export function imagegenTool(
         : args.num_last_images_to_include !== undefined
           ? await conversationImages(ctx, exec, args.num_last_images_to_include)
           : []
-      const data = await client.generate(args.prompt, images, exec.signal)
+      const data = await client.generate(
+        args.prompt,
+        images,
+        exec.signal,
+        policy.snapshot().imageGenerationModel,
+      )
       const mediaType = imageMediaType(data)
       if (mediaType !== 'image/png') throw new Error('OpenAI Codex image response was not a PNG')
       const ref = await ctx.attachments.saveImage({ data, mediaType, name: 'generated.png' })
@@ -379,7 +394,7 @@ export function imagegenTool(
       if (exec.parent !== undefined) {
         exec.deferContext(createUserMessage({
           content: contentOf(value),
-          source: { kind: 'plugin', plugin: 'dsh-openai-codex' },
+          source: OPENAI_CODEX_MESSAGE_SOURCE,
         }))
       }
       return value

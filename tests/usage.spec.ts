@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -60,7 +60,7 @@ function payload(): unknown {
 }
 
 async function authenticatedStore(): Promise<OpenAICodexCredentialStore> {
-  root = await mkdtemp(join(tmpdir(), 'dsh-openai-codex-usage-'))
+  root = await mkdtemp(join(await realpath(tmpdir()), 'dsh-openai-codex-usage-'))
   const store = new OpenAICodexCredentialStore(join(root, 'auth.json'))
   const credential: OAuthCredential = {
     type: 'oauth',
@@ -99,6 +99,49 @@ describe('OpenAI Codex usage', () => {
         remainingPercent: 75,
       },
     })
+  })
+
+  it('projects the official backend model fallback instructions without exposing banner copy', () => {
+    expect(parseOpenAICodexUsage({
+      rate_limit: {
+        primary_window: { used_percent: 100, limit_window_seconds: 18_000 },
+      },
+      rate_limit_upsell: {
+        banner_type: 'model_recovery',
+        blocked_model_slug: 'gpt-5.6-sol',
+        fallback_model_slugs: ['gpt-5.6-luna', 'gpt-5.6-terra'],
+        title: 'server-owned copy',
+      },
+    }).rateLimitUpsell).toEqual({
+      kind: 'model-recovery',
+      blockedModelSlug: 'gpt-5.6-sol',
+      fallbackModelSlugs: ['gpt-5.6-luna', 'gpt-5.6-terra'],
+    })
+  })
+
+  it('recognizes Luna Reserve without inventing a fallback list', () => {
+    expect(parseOpenAICodexUsage({
+      rate_limit_upsell: {
+        banner_type: 'luna_reserve',
+        presentation: 'dismissible',
+        title: 'server-owned copy',
+      },
+    }).rateLimitUpsell).toEqual({ kind: 'luna-reserve' })
+  })
+
+  it('ignores unsupported backend fallback shapes while retaining quota data', () => {
+    const parsed = parseOpenAICodexUsage({
+      rate_limit: {
+        primary_window: { used_percent: 10, limit_window_seconds: 18_000 },
+      },
+      rate_limit_upsell: {
+        banner_type: 'model_recovery',
+        blocked_model_slug: 'gpt-5.6-sol',
+        fallback_model_slugs: ['gpt-5.6-luna', 42],
+      },
+    })
+    expect(parsed.rateLimits[0]?.windows[0]?.remainingPercent).toBe(90)
+    expect(parsed.rateLimitUpsell).toBeUndefined()
   })
 
   it('rejects percentages that would make a quota bar misleading', () => {
@@ -177,6 +220,19 @@ describe('OpenAI Codex usage', () => {
         'cache-control': 'no-store',
       },
     })
+  })
+
+  it('uses an injected request transport for the usage endpoint', async () => {
+    const requestFetch = vi.fn(async () => response(payload()))
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('global fetch must not run') }))
+
+    const usage = await readOpenAICodexRateLimits(
+      await authenticatedStore(),
+      requestFetch,
+    )
+
+    expect(usage.rateLimits[0]?.windows[0]?.remainingPercent).toBe(87)
+    expect(requestFetch).toHaveBeenCalledOnce()
   })
 
   it.each([401, 403])('throws a secret-free reauthorization error for usage HTTP %s', async status => {

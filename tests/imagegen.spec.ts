@@ -6,10 +6,11 @@ import { Context } from '@deepseek-ai/cordis'
 import LocalAttachmentStore from '@deepseek-ai/dsh-attachment-local'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import SandboxedFileSystem from '@deepseek-ai/dsh-fs-sandbox'
-import { CallId, createUserMessage, LlmRuntime } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
+import SessionProjectionRuntime from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import WebRuntime from '@deepseek-ai/dsh-web'
 import * as OpenAICodex from '../src/index.ts'
@@ -63,6 +64,7 @@ async function setup(
   if (sandboxMode === undefined) {
     await ctx.plugin(LocalFileSystem, { cwd: workspace })
   } else {
+    await ctx.plugin(SessionProjectionRuntime)
     await ctx.plugin(SandboxPolicyService, { mode: sandboxMode, workspaceRoot: workspace })
     await ctx.plugin(SandboxedFileSystem, { cwd: workspace })
   }
@@ -83,6 +85,9 @@ function agent(
     session: {
       id: 'imagegen-session',
       events: [],
+      inheritedEventCount: 0,
+      seq: 0,
+      snapshotEvents: () => [],
       header: { cwd: workspace },
       deriveMessages: () => messages,
       requestHeader: () => ({ config: { provider, model } }),
@@ -100,7 +105,7 @@ async function generate(
 ) {
   return ctx.tools.execute({
     signal,
-    callId: CallId(`imagegen-${++callCounter}`),
+    callId: ToolCallId(`imagegen-${++callCounter}`),
     name: OpenAICodex.IMAGEGEN_TOOL_NAME,
     arguments: args,
     agent: agent(messages, model, provider) as never,
@@ -114,8 +119,23 @@ function successfulFetch() {
 }
 
 describe('imagegen', () => {
+  it('uses an injected request transport for image generation', async () => {
+    const requestFetch = successfulFetch()
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('global fetch must not run') }))
+    const client = new OpenAICodex.OpenAICodexImageClient(
+      new OpenAICodex.OpenAICodexCredentialStore(),
+      requestFetch,
+    )
+
+    await expect(client.generate('A tiny red pixel', [], signal)).resolves.toEqual(PNG_1X1)
+    expect(requestFetch).toHaveBeenCalledOnce()
+    const [, init] = requestFetch.mock.calls[0] as unknown as [string, RequestInit]
+    expect(JSON.parse(String(init.body)).model)
+      .toBe(OpenAICodex.OPENAI_CODEX_IMAGE_MODEL)
+  })
+
   it('generates an attachment and optionally publishes the same PNG to the workspace', async () => {
-    const ctx = await setup()
+    const ctx = await setup({ imageGenerationModel: 'gpt-image-2.5-sunburst' })
     const fetchMock = successfulFetch()
     vi.stubGlobal('fetch', fetchMock)
 
@@ -143,7 +163,7 @@ describe('imagegen', () => {
     expect(JSON.parse(init.body as string)).toEqual({
       prompt: 'A tiny red pixel',
       background: 'auto',
-      model: 'gpt-image-2',
+      model: 'gpt-image-2.5-sunburst',
       quality: 'auto',
       size: 'auto',
     })
@@ -217,18 +237,6 @@ describe('imagegen', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('refuses a text-only caller before generated image bytes enter its history', async () => {
-    const ctx = await setup()
-    const fetchMock = successfulFetch()
-    vi.stubGlobal('fetch', fetchMock)
-
-    const result = await generate(ctx, { prompt: 'A tiny pixel' }, [], 'gpt-5.3-codex-spark')
-
-    expect(result.isError).toBe(true)
-    expect(result.content.find(block => block.type === 'text')?.text).toContain('does not declare image input')
-    expect(fetchMock).not.toHaveBeenCalled()
-  })
-
   it('honors the setting that disables imagegen for another model provider', async () => {
     const ctx = await setup({ shareImagegenWithOtherModels: false })
     const fetchMock = successfulFetch()
@@ -239,6 +247,18 @@ describe('imagegen', () => {
     expect(result.isError).toBe(true)
     expect(result.content.find(block => block.type === 'text')?.text).toContain('disabled for models outside')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps image generation available on the backend-authorized Luna Reserve route', async () => {
+    const ctx = await setup({ shareImagegenWithOtherModels: false })
+    const fetchMock = successfulFetch()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await generate(ctx, { prompt: 'A tiny pixel' }, [], OpenAICodex.OPENAI_CODEX_LUNA_RESERVE_MODEL)
+
+    expect(result.isError).toBe(false)
+    expect(result.content.some(block => block.type === 'image')).toBe(true)
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 
   it('keeps the attachment but refuses output_path under a read-only filesystem policy', async () => {

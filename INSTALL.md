@@ -87,19 +87,19 @@ Stop and report the exact diagnostic if composition fails. Do not start OAuth wh
 Check non-secret status:
 
 ```sh
-dsh plugin --profile web exec dsh-openai-codex status
+dsh plugin --profile web exec dsh-codex status
 ```
 
 If it reports `signed in`, do not start another login. If signed out and an interactive terminal is available, run:
 
 ```sh
-dsh plugin --profile web exec dsh-openai-codex login
+dsh plugin --profile web exec dsh-codex login
 ```
 
 The command opens OpenAI's page and waits for its localhost callback. Tell the user to approve the page and keep waiting for completion. Never ask the user to paste a token. If the host cannot open a browser, use:
 
 ```sh
-dsh plugin --profile web exec dsh-openai-codex login --device-code
+dsh plugin --profile web exec dsh-codex login --device-code
 ```
 
 For a local Web profile, the equivalent path is **Settings → OpenAI Codex → Sign in with ChatGPT**. Do not require both GUI and CLI login. After approval, rerun `status` and require `signed in`.
@@ -134,8 +134,8 @@ Do not report OAuth URLs, authorization codes, token timestamps, account ids, or
 - **Client entry missing:** confirm the installed package contains `lib/client.js`, restart dsh, and repeat composition validation.
 - **Duplicate provider:** remove only a manually configured `llm-pi-ai.providers.openai-codex` route.
 - **401/403 after login:** run the dedicated login again; do not copy Codex CLI credentials.
-- **OAuth callback cannot bind:** retry with `--device-code`.
-- **Browser account route returns 403:** browser login is loopback-only; use CLI login on the dsh host.
+- **OAuth callback cannot bind:** choose **Device code** in Settings or retry CLI login with `--device-code`.
+- **Remote account route returns 403:** approve the exact Web origin on the dsh host with `trust-origin`, then use Device code when the browser is remote.
 - **Profile patch parse failure:** repair only the `llm-openai-codex` row, preserve unrelated rows, and rerun `--dump-config`.
 - **Image refusal:** select a Codex model whose catalog explicitly declares image input.
 - **Unknown `web/search-model-request`:** this event came from the discontinued fork implementation. Ask before deleting or migrating the named session; never alter all sessions automatically.
@@ -159,5 +159,5 @@ dsh plugin --profile web remove dsh-codex
 Remove only the `llm-openai-codex` row from the profile patch. Credential deletion is separate and requires explicit authorization:
 
 ```sh
-dsh plugin --profile web exec dsh-openai-codex logout
+dsh plugin --profile web exec dsh-codex logout
 ```

@@ -1,62 +1,409 @@
 /** OpenAI Codex adapter assembled from public dsh-llm-pi-ai extension points. */
 
-import { createModels } from '@earendil-works/pi-ai'
-import type { Context as PiContext, MutableModels, Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
-import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
-import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
-import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
-import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
-import type { OpenAICodexCredentialStore } from './store.ts'
-import { OPENAI_CODEX_PROVIDER } from './store.ts'
-import { OpenAICodexResponseRuntime } from './responses.ts'
-import type { ModelCatalogEntry, ResponseApiPreferences } from './tool-policy.ts'
-import type { FastModeRegistry } from './fast-mode.ts'
+import { createModels } from "@earendil-works/pi-ai";
+import type {
+  AuthContext,
+  Context as PiContext,
+  FetchFunction,
+  MutableModels,
+  Provider,
+  SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+import { openaiCodexProvider } from "./oauth-provider.ts";
+import { resolveRetryPolicy } from "@deepseek-ai/dsh-llm";
+import type {
+  GenerateOptions,
+  PreparedAdapterCall,
+  StreamChunk,
+} from "@deepseek-ai/dsh-llm";
+import { PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
+import type { ResolvedPiAiProviderProfile } from "@deepseek-ai/dsh-llm-pi-ai";
+import type {
+  AttachmentStore,
+  ImageAttachmentRef,
+  ImageRequestTarget,
+} from "@deepseek-ai/dsh-attachment";
+import type { OpenAICodexCredentialStore } from "./store.ts";
+import { OPENAI_CODEX_PROVIDER } from "./store.ts";
+import { OpenAICodexResponseRuntime } from "./responses.ts";
+import type {
+  ModelCatalogEntry,
+  ResponseApiPreferences,
+} from "./tool-policy.ts";
+import type { FastModeRegistry } from "./fast-mode.ts";
+import {
+  isSupportedOpenAICodexModel,
+  OpenAICodexModelCatalog,
+} from "./model-catalog.ts";
 
-/** Return a detached copy of the complete pi-ai Codex model catalog. */
-export function openAICodexModelCatalog(): readonly ModelCatalogEntry[] {
-  return openaiCodexProvider().getModels().map(model => ({ id: model.id, name: model.name }))
+const GPT_6_ASTRA = "gpt-6-astra";
+const GPT_6_SOL = "gpt-6-sol";
+const GPT_6_LUNA = "gpt-6-luna";
+const GPT_5_6_LUNA = "gpt-5.6-luna";
+/** Backend-authorized Luna Reserve route; deliberately hidden from discovery. */
+export const OPENAI_CODEX_LUNA_RESERVE_MODEL = "gpt-reserve";
+
+const OPENAI_CODEX_MODEL_ORDER = new Map<string, number>(
+  [
+    GPT_6_ASTRA,
+    GPT_6_SOL,
+    GPT_6_LUNA,
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    GPT_5_6_LUNA,
+    "gpt-5.5",
+  ].map((id, index) => [id, index])
+);
+
+const CURRENT_CODEX_MODELS = [
+  {
+    id: GPT_6_SOL,
+    name: "GPT-6 Sol",
+    template: "gpt-5.6-sol",
+    cost: {
+      input: 2,
+      output: 10,
+      cacheRead: 0.2,
+      cacheWrite: 2.5,
+      tiers: [
+        {
+          inputTokensAbove: 272_000,
+          input: 4,
+          output: 15,
+          cacheRead: 0.4,
+          cacheWrite: 5,
+        },
+      ],
+    },
+  },
+  {
+    id: GPT_6_LUNA,
+    name: "GPT-6 Luna",
+    template: GPT_5_6_LUNA,
+    cost: {
+      input: 0.1,
+      output: 0.5,
+      cacheRead: 0.01,
+      cacheWrite: 0.125,
+      tiers: [
+        {
+          inputTokensAbove: 272_000,
+          input: 0.2,
+          output: 0.75,
+          cacheRead: 0.02,
+          cacheWrite: 0.25,
+        },
+      ],
+    },
+  },
+];
+
+/** Add current Codex releases missing from the compatible pi-ai catalog. */
+export function withCurrentOpenAICodexModels(provider: Provider): Provider {
+  const getModels = provider.getModels;
+  let sourceModels: ReturnType<Provider["getModels"]> | undefined;
+  let currentModels: ReturnType<Provider["getModels"]> | undefined;
+  return {
+    ...provider,
+    getModels() {
+      const models = getModels.call(provider);
+      if (models === sourceModels && currentModels !== undefined)
+        return currentModels;
+      const known = new Set(models.map((model) => model.id));
+      const additions = CURRENT_CODEX_MODELS.flatMap((entry) => {
+        if (known.has(entry.id)) return [];
+        const template = models.find((model) => model.id === entry.template) ??
+          models.find((model) => model.id === GPT_6_ASTRA);
+        if (template === undefined) return [];
+        return [{
+          ...template,
+          id: entry.id,
+          name: entry.name,
+          cost: entry.cost,
+          contextWindow: 272_000,
+          maxTokens: 128_000,
+          thinkingLevelMap: {
+            off: "none",
+            minimal: "low",
+            low: "low",
+            medium: "medium",
+            high: "high",
+            xhigh: "xhigh",
+            max: "max",
+          },
+        }];
+      });
+      const next = additions.length === 0 ? models : [...models, ...additions];
+      sourceModels = models;
+      currentModels = next;
+      return next;
+    },
+  };
+}
+
+/** Present the current pi-ai Codex catalog in product order. */
+function withOpenAICodexModelOrder(provider: Provider): Provider {
+  const getModels = provider.getModels;
+  return {
+    ...provider,
+    getModels() {
+      return [...getModels.call(provider)]
+        .map((model, index) => ({ model, index }))
+        .sort((left, right) => {
+          const leftOrder =
+            OPENAI_CODEX_MODEL_ORDER.get(left.model.id) ?? Number.MAX_SAFE_INTEGER;
+          const rightOrder =
+            OPENAI_CODEX_MODEL_ORDER.get(right.model.id) ?? Number.MAX_SAFE_INTEGER;
+          return leftOrder - rightOrder || left.index - right.index;
+        })
+        .map(({ model }) => model);
+    },
+  };
+}
+
+/**
+ * Make the official hidden Reserve route exactly resolvable without advertising
+ * it for manual selection. Codex borrows Luna's model capabilities for Reserve.
+ */
+function withOpenAICodexLunaReserve(provider: Provider): Provider {
+  const getModels = provider.getModels;
+  let sourceModels: ReturnType<Provider["getModels"]> | undefined;
+  let reserveModels: ReturnType<Provider["getModels"]> | undefined;
+  return {
+    ...provider,
+    getModels() {
+      const models = getModels.call(provider);
+      if (models === sourceModels && reserveModels !== undefined)
+        return reserveModels;
+      if (models.some((model) => model.id === OPENAI_CODEX_LUNA_RESERVE_MODEL))
+        return models;
+      const luna = models.find((model) => model.id === GPT_5_6_LUNA);
+      const next = luna === undefined
+        ? models
+        : [
+            ...models,
+            {
+              ...luna,
+              id: OPENAI_CODEX_LUNA_RESERVE_MODEL,
+              name: "Luna Reserve",
+            },
+          ];
+      sourceModels = models;
+      reserveModels = next;
+      return next;
+    },
+  };
+}
+
+/** Keep bundled models as a fallback and discover new releases from Codex metadata. */
+export function createOpenAICodexModelProvider(requestFetch?: typeof globalThis.fetch): Provider {
+  const upstream = openaiCodexProvider(requestFetch);
+  const provider = withOpenAICodexModelOrder(
+    withCurrentOpenAICodexModels({
+      ...upstream,
+      getModels: () => upstream.getModels().filter((model) =>
+        isSupportedOpenAICodexModel(model.id)
+      ),
+    })
+  );
+  const catalog = new OpenAICodexModelCatalog(provider.getModels());
+  return withOpenAICodexLunaReserve({
+    ...provider,
+    getModels: () => catalog.getModels(),
+  });
+}
+
+/** Return a detached copy of the current Codex model catalog for settings. */
+export function openAICodexModelCatalog(
+  provider: Provider = createOpenAICodexModelProvider()
+): readonly ModelCatalogEntry[] {
+  return provider
+    .getModels()
+    .filter((model) => model.id !== OPENAI_CODEX_LUNA_RESERVE_MODEL)
+    .map((model) => ({
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow,
+    }));
 }
 
 /** Provider idle ceiling used by the composite route. */
-export const OPENAI_CODEX_STREAM_IDLE_TIMEOUT_MS = 300_000
+export const OPENAI_CODEX_STREAM_IDLE_TIMEOUT_MS = 300_000;
+
+/** Patch geometry used by Codex for `auto`/`high` prompt images. */
+export const OPENAI_CODEX_IMAGE_PATCH_SIZE = 32;
+/** Maximum patch count used by Codex for `auto`/`high` prompt images. */
+export const OPENAI_CODEX_HIGH_DETAIL_MAX_PATCHES = 2_500;
+/** Maximum width or height accepted by Codex's `auto`/`high` preparation. */
+export const OPENAI_CODEX_HIGH_DETAIL_MAX_DIMENSION = 2_048;
+/** Closest DSH pixel-budget projection of Codex's 2,500 32x32 patch limit. */
+export const OPENAI_CODEX_REQUEST_IMAGE_PIXEL_BUDGET =
+  OPENAI_CODEX_HIGH_DETAIL_MAX_PATCHES * OPENAI_CODEX_IMAGE_PATCH_SIZE ** 2;
+/**
+ * Codex's high sanity guard for one prompt-image representation. DSH already
+ * validates and normalizes attachments at much smaller ingestion limits, so
+ * this deliberately avoids imposing a second lossy byte target on an image.
+ */
+export const OPENAI_CODEX_PROMPT_IMAGE_INPUT_GUARD_BYTES = 1024 * 1024 * 1024;
+
+function projectedImageDimensions(
+  width: number,
+  height: number,
+  maxPixels: number
+): { width: number; height: number } {
+  const scale = Math.min(1, Math.sqrt(maxPixels / (width * height)));
+  if (scale === 1) return { width, height };
+  if (width >= height) {
+    let projectedWidth = Math.max(1, Math.floor(width * scale));
+    let projectedHeight = Math.max(
+      1,
+      Math.round((projectedWidth * height) / width)
+    );
+    while (projectedWidth * projectedHeight > maxPixels && projectedWidth > 1) {
+      projectedWidth -= 1;
+      projectedHeight = Math.max(
+        1,
+        Math.round((projectedWidth * height) / width)
+      );
+    }
+    return { width: projectedWidth, height: projectedHeight };
+  }
+  let projectedHeight = Math.max(1, Math.floor(height * scale));
+  let projectedWidth = Math.max(
+    1,
+    Math.round((projectedHeight * width) / height)
+  );
+  while (projectedWidth * projectedHeight > maxPixels && projectedHeight > 1) {
+    projectedHeight -= 1;
+    projectedWidth = Math.max(
+      1,
+      Math.round((projectedHeight * width) / height)
+    );
+  }
+  return { width: projectedWidth, height: projectedHeight };
+}
+
+function fitsOpenAICodexHighDetail(width: number, height: number): boolean {
+  const patchesWide = Math.ceil(width / OPENAI_CODEX_IMAGE_PATCH_SIZE);
+  const patchesHigh = Math.ceil(height / OPENAI_CODEX_IMAGE_PATCH_SIZE);
+  return (
+    width <= OPENAI_CODEX_HIGH_DETAIL_MAX_DIMENSION &&
+    height <= OPENAI_CODEX_HIGH_DETAIL_MAX_DIMENSION &&
+    patchesWide * patchesHigh <= OPENAI_CODEX_HIGH_DETAIL_MAX_PATCHES
+  );
+}
+
+/**
+ * Tighten DSH's area-only request projection until its resulting dimensions
+ * also satisfy Codex's longest-edge and rounded patch-grid limits.
+ */
+export function openAICodexRequestImagePixelBudget(
+  width: number,
+  height: number,
+  maxPixels: number
+): number {
+  const projected = projectedImageDimensions(width, height, maxPixels);
+  if (fitsOpenAICodexHighDetail(projected.width, projected.height))
+    return maxPixels;
+
+  let lower = 1;
+  let upper = Math.min(maxPixels, width * height - 1);
+  let accepted = 1;
+  while (lower <= upper) {
+    const candidate = lower + Math.floor((upper - lower) / 2);
+    const dimensions = projectedImageDimensions(width, height, candidate);
+    if (fitsOpenAICodexHighDetail(dimensions.width, dimensions.height)) {
+      accepted = candidate;
+      lower = candidate + 1;
+    } else {
+      upper = candidate - 1;
+    }
+  }
+  const dimensions = projectedImageDimensions(width, height, accepted);
+  return dimensions.width * dimensions.height;
+}
+
+function withOpenAICodexImagePolicy(store: AttachmentStore): AttachmentStore {
+  return new Proxy(store, {
+    get(target, property) {
+      if (property === "readImageRequest") {
+        return (
+          ref: ImageAttachmentRef,
+          targetPolicy: ImageRequestTarget,
+          signal?: AbortSignal
+        ) => {
+          const maxPixels = openAICodexRequestImagePixelBudget(
+            ref.width,
+            ref.height,
+            targetPolicy.width * targetPolicy.height
+          );
+          return target.readImageRequest(
+            ref,
+            {
+              ...targetPolicy,
+              ...projectedImageDimensions(ref.width, ref.height, maxPixels),
+            },
+            signal
+          );
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/** Codex authentication is deliberately confined to this plugin's OAuth store. */
+const OPENAI_CODEX_AUTH_CONTEXT: AuthContext = {
+  async env() {
+    return undefined;
+  },
+  async fileExists() {
+    return false;
+  },
+};
 
 function record(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 /** Lift the pre-rc.7 pi-ai replay shape into the current envelope on read. */
 export function migrateLegacyOpenAICodexReplayState(value: unknown): unknown {
-  const legacy = record(value)
-  if (legacy?.['kind'] !== 'pi-ai' || legacy['version'] !== 1 || !Array.isArray(legacy['blocks'])) return value
-  const {
-    blocks,
-    kind: _kind,
-    version: _version,
-    ...response
-  } = legacy
+  const legacy = record(value);
+  if (
+    legacy?.["kind"] !== "pi-ai" ||
+    legacy["version"] !== 1 ||
+    !Array.isArray(legacy["blocks"])
+  )
+    return value;
+  const { blocks, kind: _kind, version: _version, ...response } = legacy;
   return {
-    response: { ...response, kind: 'pi-ai', version: 2 },
+    response: { ...response, kind: "pi-ai", version: 2 },
     blocks,
-  }
+  };
 }
 
 function migrateReplayHistory(options: GenerateOptions): GenerateOptions {
-  let changed = false
-  const messages = options.messages.map(message => {
-    if (message.source.kind !== 'model' || message.source.replayState === undefined) return message
-    const replayState = migrateLegacyOpenAICodexReplayState(message.source.replayState)
-    if (replayState === message.source.replayState) return message
-    changed = true
+  let changed = false;
+  const messages = options.messages.map((message) => {
+    if (
+      message.role !== "assistant" ||
+      message.source.replayState === undefined
+    )
+      return message;
+    const replayState = migrateLegacyOpenAICodexReplayState(
+      message.source.replayState
+    );
+    if (replayState === message.source.replayState) return message;
+    changed = true;
     return {
       ...message,
       source: { ...message.source, replayState },
-    }
-  })
-  return changed ? { ...options, messages } : options
+    };
+  });
+  return changed ? { ...options, messages } : options;
 }
 
 /**
@@ -65,11 +412,14 @@ function migrateReplayHistory(options: GenerateOptions): GenerateOptions {
  * default stops after 2 retries and caps scheduled delays at 10 seconds, so
  * this provider retries longer and backs off further to ride out such a blip.
  */
-export const OPENAI_CODEX_RETRY_POLICY = resolveRetryPolicy({
-  mode: 'normal',
-  maxRetries: 5,
-  backoff: { initialDelayMs: 1_000, maxDelayMs: 30_000, jitterRatio: 0.2 },
-}, 'dsh-openai-codex retryPolicy')
+export const OPENAI_CODEX_RETRY_POLICY = resolveRetryPolicy(
+  {
+    mode: "normal",
+    maxRetries: 5,
+    backoff: { initialDelayMs: 1_000, maxDelayMs: 30_000, jitterRatio: 0.2 },
+  },
+  "dsh-openai-codex retryPolicy"
+);
 
 /**
  * Give the generic dsh adapter a request-scoped bearer-token entry without
@@ -78,53 +428,99 @@ export const OPENAI_CODEX_RETRY_POLICY = resolveRetryPolicy({
  * key from the environment or persistent api-key credentials.
  */
 function isPayloadRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Add the request-scoped Fast Mode hint without changing other payload fields. */
 export function withOpenAICodexFastMode(
   provider: Provider,
   fastMode: FastModeRegistry | undefined,
+  fastModeDefault?: () => boolean
 ): Provider {
-  const streamSimple = provider.streamSimple
+  const streamSimple = provider.streamSimple;
   return {
     ...provider,
     streamSimple(model, context: PiContext, options?: SimpleStreamOptions) {
-      const enabled = provider.id === OPENAI_CODEX_PROVIDER
-        && model.provider === OPENAI_CODEX_PROVIDER
-        && fastMode?.isEnabled(options?.sessionId) === true
-      if (!enabled) return streamSimple.call(provider, model, context, options)
-      const previousOnPayload = options?.onPayload
+      const enabled =
+        provider.id === OPENAI_CODEX_PROVIDER &&
+        model.provider === OPENAI_CODEX_PROVIDER &&
+        model.id !== OPENAI_CODEX_LUNA_RESERVE_MODEL &&
+        (fastModeDefault?.() === true ||
+          fastMode?.isEnabled(options?.sessionId) === true);
+      if (!enabled) return streamSimple.call(provider, model, context, options);
+      const previousOnPayload = options?.onPayload;
       return streamSimple.call(provider, model, context, {
         ...options,
         async onPayload(payload, payloadModel) {
-          const replaced = await previousOnPayload?.(payload, payloadModel)
-          const nextPayload = replaced === undefined ? payload : replaced
+          const replaced = await previousOnPayload?.(payload, payloadModel);
+          const nextPayload = replaced === undefined ? payload : replaced;
           return isPayloadRecord(nextPayload)
-            ? { ...nextPayload, service_tier: 'priority' }
-            : nextPayload
+            ? { ...nextPayload, service_tier: "priority" }
+            : nextPayload;
         },
-      })
+      });
     },
-  }
+  };
 }
 
-function requestProvider(provider: Provider, fastMode?: FastModeRegistry): Provider {
+/** Override provider model capacities without changing request payload fields. */
+function withOpenAICodexContextWindow(
+  provider: Provider,
+  contextWindow: number | null | undefined
+): Provider {
+  if (contextWindow === null || contextWindow === undefined) return provider;
+  const getModels = provider.getModels;
   return {
-    ...withOpenAICodexFastMode(provider, fastMode),
+    ...provider,
+    getModels() {
+      return getModels
+        .call(provider)
+        .map((model) =>
+          model.id === OPENAI_CODEX_LUNA_RESERVE_MODEL
+            ? model
+            : { ...model, contextWindow }
+        );
+    },
+  };
+}
+
+function requestProvider(
+  provider: Provider,
+  fastMode?: FastModeRegistry,
+  fastModeDefault?: () => boolean,
+  requestFetch?: FetchFunction
+): Provider {
+  const configured = withOpenAICodexFastMode(
+    provider,
+    fastMode,
+    fastModeDefault
+  );
+  const streamSimple = configured.streamSimple;
+  return {
+    ...configured,
+    streamSimple(model, context, options) {
+      return streamSimple.call(configured, model, context, {
+        ...options,
+        ...(options?.fetch !== undefined
+          ? {}
+          : requestFetch === undefined
+            ? {}
+            : { fetch: requestFetch }),
+      });
+    },
     auth: {
-      ...provider.auth,
+      ...configured.auth,
       apiKey: {
-        name: 'OpenAI Codex OAuth bearer token',
+        name: "OpenAI Codex OAuth bearer token",
         async resolve({ credential }) {
-          const apiKey = credential?.key
+          const apiKey = credential?.key;
           return apiKey === undefined || apiKey.length === 0
             ? undefined
-            : { auth: { apiKey }, source: 'OAuth' }
+            : { auth: { apiKey }, source: "OAuth" };
         },
       },
     },
-  }
+  };
 }
 
 /** Preserve Harness call purpose until the generic pi-ai adapter reaches the provider. */
@@ -132,28 +528,55 @@ class OpenAICodexAdapter extends PiAiAdapter {
   constructor(
     options: ConstructorParameters<typeof PiAiAdapter>[0],
     private readonly responses: OpenAICodexResponseRuntime,
-    private readonly visibleModelIds?: () => readonly string[],
+    private readonly visibleModelIds?: () => readonly string[]
   ) {
-    super(options)
+    super(options);
   }
 
   override async listModels(provider: string) {
-    const models = await super.listModels(provider)
-    const visibleModelIds = this.visibleModelIds?.()
-    if (visibleModelIds === undefined) return models
-    const visible = new Set(visibleModelIds)
-    return models.filter(model => visible.has(model.id))
+    const models = (await super.listModels(provider)).filter(
+      (model) => model.id !== OPENAI_CODEX_LUNA_RESERVE_MODEL
+    );
+    const visibleModelIds = this.visibleModelIds?.();
+    if (visibleModelIds === undefined) return models;
+    const visible = new Set(visibleModelIds);
+    return models.filter((model) => visible.has(model.id));
+  }
+
+  private async *streamPrepared(
+    stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>,
+    options: GenerateOptions
+  ): AsyncIterable<StreamChunk> {
+    const release =
+      options.purpose === "compaction"
+        ? this.responses.enterCompaction(
+            options.sessionId === undefined
+              ? undefined
+              : String(options.sessionId)
+          )
+        : undefined;
+    try {
+      for await (const chunk of stream(migrateReplayHistory(options)))
+        yield chunk;
+    } finally {
+      release?.();
+    }
+  }
+
+  override async prepareCall(
+    provider: string,
+    model: string,
+    signal?: AbortSignal
+  ): Promise<PreparedAdapterCall> {
+    const prepared = await super.prepareCall(provider, model, signal);
+    return {
+      model: prepared.model,
+      stream: (options) => this.streamPrepared(prepared.stream, options),
+    };
   }
 
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const release = options.purpose === 'compaction'
-      ? this.responses.enterCompaction(options.sessionId === undefined ? undefined : String(options.sessionId))
-      : undefined
-    try {
-      for await (const chunk of super.stream(migrateReplayHistory(options))) yield chunk
-    } finally {
-      release?.()
-    }
+    yield* this.streamPrepared((next) => super.stream(next), options);
   }
 }
 
@@ -169,22 +592,83 @@ export function createOpenAICodexAdapter(
   responsePreferences: () => ResponseApiPreferences,
   fastMode?: FastModeRegistry,
   visibleModelIds?: () => readonly string[],
+  contextWindow?: () => number | null | undefined,
+  requestFetch?: FetchFunction,
+  fastModeDefault?: () => boolean,
+  modelProvider: Provider = createOpenAICodexModelProvider()
 ): PiAiAdapter {
-  const provider = openaiCodexProvider()
-  const responses = new OpenAICodexResponseRuntime(responsePreferences)
-  const profiles = new Map<string, ResolvedPiAiProviderProfile>([[OPENAI_CODEX_PROVIDER, {
-    provider: OPENAI_CODEX_PROVIDER,
-    displayName: 'OpenAI Codex',
-    streamIdleTimeoutMs: OPENAI_CODEX_STREAM_IDLE_TIMEOUT_MS,
-    retryPolicy: OPENAI_CODEX_RETRY_POLICY,
-    configuredMaxTokens: new Map(),
-    piProvider: responses.wrap(requestProvider(provider, fastMode)),
-  }]])
-  const models: MutableModels = createModels({ credentials })
-  models.setProvider(provider)
-  return new OpenAICodexAdapter({
-    profiles: () => profiles,
-    resolveApiKey: async () => (await models.getAuth(OPENAI_CODEX_PROVIDER))?.auth.apiKey,
-    resolveAttachments,
-  }, responses, visibleModelIds)
+  const provider = requestProvider(
+    modelProvider,
+    fastMode,
+    fastModeDefault,
+    requestFetch
+  );
+  const responses = new OpenAICodexResponseRuntime(
+    responsePreferences,
+    requestFetch
+  );
+  const unset = Symbol("unset context window");
+  let resolvedContextWindow: number | null | undefined | typeof unset = unset;
+  let resolvedProfiles: Map<string, ResolvedPiAiProviderProfile> | undefined;
+  let resolvedModelCatalog: ReturnType<Provider["getModels"]> | undefined;
+  const profiles = (): Map<string, ResolvedPiAiProviderProfile> => {
+    const nextModelCatalog = provider.getModels();
+    const nextContextWindow = contextWindow?.();
+    if (
+      resolvedProfiles !== undefined &&
+      nextModelCatalog === resolvedModelCatalog &&
+      nextContextWindow === resolvedContextWindow
+    )
+      return resolvedProfiles;
+    const configuredProvider = withOpenAICodexContextWindow(
+      { ...provider, getModels: () => nextModelCatalog },
+      nextContextWindow
+    );
+    const profile: ResolvedPiAiProviderProfile = {
+      provider: OPENAI_CODEX_PROVIDER,
+      displayName: "OpenAI Codex",
+      streamIdleTimeoutMs: OPENAI_CODEX_STREAM_IDLE_TIMEOUT_MS,
+      // pi-ai emits `detail: "auto"`. The profile carries Codex's patch-derived
+      // area budget; the provider-scoped attachment wrapper below further
+      // tightens it per image for the 2048px edge and rounded patch-grid limits.
+      requestImagePixelBudget: OPENAI_CODEX_REQUEST_IMAGE_PIXEL_BUDGET,
+      // DSH exposes an aggregate history limit rather than Codex's per-image
+      // input guard. Reusing the 1GiB sanity ceiling keeps pathological history
+      // bounded without evicting normal image turns at an arbitrary 20MiB.
+      maxRequestImageBytes: OPENAI_CODEX_PROMPT_IMAGE_INPUT_GUARD_BYTES,
+      requestImageMaxBytes: OPENAI_CODEX_PROMPT_IMAGE_INPUT_GUARD_BYTES,
+      retryPolicy: OPENAI_CODEX_RETRY_POLICY,
+      configuredMaxTokens: new Map(),
+      modelErrors: new Map(),
+      piProvider: responses.wrap(configuredProvider),
+    };
+    resolvedContextWindow = nextContextWindow;
+    resolvedModelCatalog = nextModelCatalog;
+    resolvedProfiles = new Map([[OPENAI_CODEX_PROVIDER, profile]]);
+    return resolvedProfiles;
+  };
+  const auth = { credentials, authContext: OPENAI_CODEX_AUTH_CONTEXT };
+  const models: MutableModels = createModels(auth);
+  models.setProvider(provider);
+  let attachmentStore: AttachmentStore | undefined;
+  let codexAttachmentStore: AttachmentStore | undefined;
+  return new OpenAICodexAdapter(
+    {
+      profiles,
+      resolveApiKey: async () =>
+        (await models.getAuth(OPENAI_CODEX_PROVIDER))?.auth.apiKey,
+      auth,
+      resolveAttachments: () => {
+        const resolved = resolveAttachments();
+        if (resolved === undefined) return undefined;
+        if (resolved !== attachmentStore) {
+          attachmentStore = resolved;
+          codexAttachmentStore = withOpenAICodexImagePolicy(resolved);
+        }
+        return codexAttachmentStore;
+      },
+    },
+    responses,
+    visibleModelIds
+  );
 }
